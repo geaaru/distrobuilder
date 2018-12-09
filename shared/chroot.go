@@ -147,7 +147,7 @@ func killChrootProcesses(rootfs string) error {
 }
 
 // SetupChroot sets up mount and files, a reverter and then chroots for you
-func SetupChroot(rootfs string) (func() error, error) {
+func SetupChroot(rootfs string, envs []DefinitionEnvVars) (func() error, error) {
 	// Mount the rootfs
 	err := syscall.Mount(rootfs, rootfs, "", syscall.MS_BIND, "")
 	if err != nil {
@@ -200,8 +200,10 @@ func SetupChroot(rootfs string) (func() error, error) {
 	}
 
 	// Set environment variables
-	oldEnvVariables := SetEnvVariables(
-		[]EnvVariable{
+	var env_vars []EnvVariable = []EnvVariable{}
+
+	if envs == nil || len(envs) == 0 {
+		env_vars = []EnvVariable{
 			{
 				Key:   "PATH",
 				Value: "/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin",
@@ -222,7 +224,19 @@ func SetupChroot(rootfs string) (func() error, error) {
 				Value: "noninteractive",
 				Set:   true,
 			},
-		})
+		}
+
+	} else {
+		for _, env := range envs {
+			env_vars = append(env_vars, EnvVariable{
+				Key:   env.Key,
+				Value: env.Value,
+				Set:   true,
+			})
+		}
+	}
+
+	oldEnvVariables := SetEnvVariables(env_vars)
 
 	// Setup policy-rc.d override
 	policyCleanup := false
