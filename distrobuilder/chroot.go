@@ -15,6 +15,21 @@ func managePackages(def shared.DefinitionPackages, actions []shared.DefinitionAc
 		return fmt.Errorf("Couldn't get manager")
 	}
 
+	// Handle repositories actions
+	if def.Repositories != nil && len(def.Repositories) > 0 {
+		if manager.RepoHandler == nil {
+			return fmt.Errorf("No repository handler present!")
+		}
+
+		for _, repo := range def.Repositories {
+			err = manager.RepoHandler(repo)
+			if err != nil {
+				return fmt.Errorf(
+					fmt.Sprintf("Error for repository %s: %s", repo.Name, err))
+			}
+		}
+	}
+
 	err = manager.Refresh()
 	if err != nil {
 		return err

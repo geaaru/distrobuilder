@@ -14,13 +14,24 @@ import (
 	"github.com/lxc/lxd/shared"
 )
 
+// A DefinitionRepository contains data of a specific repository
+type DefinitionRepository struct {
+	Name string `yaml:"name"`
+	Url  string `yaml:"url"`
+	// This option is needed only for Sabayon repository
+	// for identify tool to use: enman|equo
+	Type   string `yaml:"type"`
+	Action string `yaml:"action"`
+}
+
 // A DefinitionPackages list packages which are to be either installed or
 // removed.
 type DefinitionPackages struct {
-	Manager string   `yaml:"manager"`
-	Install []string `yaml:"install,omitempty"`
-	Remove  []string `yaml:"remove,omitempty"`
-	Update  bool     `yaml:"update,omitempty"`
+	Manager      string                 `yaml:"manager"`
+	Install      []string               `yaml:"install,omitempty"`
+	Remove       []string               `yaml:"remove,omitempty"`
+	Update       bool                   `yaml:"update,omitempty"`
+	Repositories []DefinitionRepository `yaml:"repositories"`
 }
 
 // A DefinitionImage represents the image.
