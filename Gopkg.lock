@@ -308,7 +308,7 @@
 
 [[projects]]
   branch = "master"
-  digest = "1:d600604da5d37645e2f8cc7466034499559243f2b422ed3021bceecb754a292c"
+  digest = "1:2b97ed7f1a1032f8ee410e98dca2c838e9207bfcaaffaefa861bd30f18f371b4"
   name = "github.com/lxc/lxd"
   packages = [
     "shared",
@@ -318,7 +318,7 @@
     "shared/logger",
     "shared/osarch",
   ]
-  pruneopts = "UT"
+  pruneopts = "T"
   revision = "4b93f6e69978a11ea1d549aefc68738ae264b497"
 
 [[projects]]
@@ -390,7 +390,7 @@
   version = "v1.0.1"
 
 [[projects]]
-  digest = "1:86152e5dfb62b1e2fb234495a27ff4ccb369d210bd1a46af688f6e514dcf2aaa"
+  digest = "1:8e29919b351fc84fd71a1c8c6952db264490d270db419138f4534bc4bb09e9fc"
   name = "github.com/opencontainers/runtime-tools"
   packages = [
     "error",
@@ -401,18 +401,8 @@
     "validate",
   ]
   pruneopts = "UT"
-  revision = "ee63cfa6f66491e78f8e63c37806d7a905eb836e"
-  version = "v0.9.0"
-
-[[projects]]
-  digest = "1:d408ed581b24039d5ee4bf40929542993302fda32662327b5c515a98a8a3ebc2"
-  name = "github.com/opencontainers/selinux"
-  packages = [
-    "go-selinux",
-    "go-selinux/label",
-  ]
-  pruneopts = "UT"
-  revision = "2d93b96e1a01b26e3378c49a974d11f6783ec185"
+  revision = "a4a33d4d2f6933bb8add5e1a6bf8f9374f09555b"
+  version = "v0.8.0"
 
 [[projects]]
   digest = "1:40e195917a951a8bf867cd05de2a46aaf1806c50cf92eebf4c16f78cd196f747"
