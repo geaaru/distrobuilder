@@ -93,7 +93,7 @@ func (tpl *Template) execute(context Context) (*bytes.Buffer, error) {
 			}
 
 			// Check for clashes with macro names
-			for k := range newContext {
+			for k, _ := range newContext {
 				_, has := tpl.exported_macros[k]
 				if has {
 					return nil, &Error{
