@@ -10,6 +10,7 @@
 package hcsschema
 
 type VirtualMachine struct {
+
 	Chipset *Chipset `json:"Chipset,omitempty"`
 
 	ComputeTopology *Topology `json:"ComputeTopology,omitempty"`

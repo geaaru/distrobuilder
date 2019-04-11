@@ -60,3 +60,12 @@
 [[prune.project]]
 name = "github.com/lxc/lxd"
 unused-packages = false
+
+[[constraint]]
+  name = "github.com/opencontainers/runtime-spec"
+  version = "1.0.1"
+
+[[override]]
+  name = "github.com/opencontainers/runtime-tools"
+  version = "0.8.0"
+

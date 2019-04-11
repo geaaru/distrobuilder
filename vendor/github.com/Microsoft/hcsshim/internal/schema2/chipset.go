@@ -10,6 +10,7 @@
 package hcsschema
 
 type Chipset struct {
+
 	Uefi *Uefi `json:"Uefi,omitempty"`
 
 	IsNumLockDisabled bool `json:"IsNumLockDisabled,omitempty"`
