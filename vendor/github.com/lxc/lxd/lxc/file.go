@@ -6,11 +6,11 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
+	"os/signal"
 	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 
 	"github.com/spf13/cobra"
 
@@ -22,6 +22,7 @@ import (
 	"github.com/lxc/lxd/shared/ioprogress"
 	"github.com/lxc/lxd/shared/logger"
 	"github.com/lxc/lxd/shared/termios"
+	"github.com/lxc/lxd/shared/units"
 )
 
 type cmdFile struct {
@@ -33,6 +34,35 @@ type cmdFile struct {
 
 	flagMkdir     bool
 	flagRecursive bool
+}
+
+func fileGetWrapper(server lxd.ContainerServer, container string, path string) (buf io.ReadCloser, resp *lxd.ContainerFileResponse, err error) {
+	// Signal handling
+	chSignal := make(chan os.Signal)
+	signal.Notify(chSignal, os.Interrupt)
+
+	// Operation handling
+	chDone := make(chan bool)
+	go func() {
+		buf, resp, err = server.GetContainerFile(container, path)
+		close(chDone)
+	}()
+
+	count := 0
+	for {
+		select {
+		case <-chDone:
+			return buf, resp, err
+		case <-chSignal:
+			count++
+
+			if count == 3 {
+				return nil, nil, fmt.Errorf(i18n.G("User signaled us three times, exiting. The remote operation will keep running"))
+			}
+
+			fmt.Println(i18n.G("Early server side processing of file tranfer requests cannot be canceled (interrupt two more times to force)"))
+		}
+	}
 }
 
 func (c *cmdFile) Command() *cobra.Command {
@@ -139,7 +169,7 @@ func (c *cmdFileEdit) Run(cmd *cobra.Command, args []string) error {
 	}
 
 	// If stdin isn't a terminal, read text from it
-	if !termios.IsTerminal(int(syscall.Stdin)) {
+	if !termios.IsTerminal(getStdinFd()) {
 		return c.filePush.Run(cmd, append([]string{os.Stdin.Name()}, args[0]))
 	}
 
@@ -245,7 +275,7 @@ func (c *cmdFilePull) Run(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf(i18n.G("Invalid source %s"), resource.name)
 		}
 
-		buf, resp, err := resource.server.GetContainerFile(pathSpec[0], pathSpec[1])
+		buf, resp, err := fileGetWrapper(resource.server, pathSpec[0], pathSpec[1])
 		if err != nil {
 			return err
 		}
@@ -345,8 +375,8 @@ func (c *cmdFilePull) Run(cmd *cobra.Command, args []string) error {
 
 					progress.UpdateProgress(ioprogress.ProgressData{
 						Text: fmt.Sprintf("%s (%s/s)",
-							shared.GetByteSizeString(bytesReceived, 2),
-							shared.GetByteSizeString(speed, 2))})
+							units.GetByteSizeString(bytesReceived, 2),
+							units.GetByteSizeString(speed, 2))})
 				},
 			},
 		}
@@ -600,7 +630,7 @@ func (c *cmdFilePush) Run(cmd *cobra.Command, args []string) error {
 				Length: fstat.Size(),
 				Handler: func(percent int64, speed int64) {
 					progress.UpdateProgress(ioprogress.ProgressData{
-						Text: fmt.Sprintf("%d%% (%s/s)", percent, shared.GetByteSizeString(speed, 2)),
+						Text: fmt.Sprintf("%d%% (%s/s)", percent, units.GetByteSizeString(speed, 2)),
 					})
 				},
 			},
@@ -664,8 +694,8 @@ func (c *cmdFile) recursivePullFile(d lxd.ContainerServer, container string, p s
 				Handler: func(bytesReceived int64, speed int64) {
 					progress.UpdateProgress(ioprogress.ProgressData{
 						Text: fmt.Sprintf("%s (%s/s)",
-							shared.GetByteSizeString(bytesReceived, 2),
-							shared.GetByteSizeString(speed, 2))})
+							units.GetByteSizeString(bytesReceived, 2),
+							units.GetByteSizeString(speed, 2))})
 				},
 			},
 		}
@@ -768,7 +798,7 @@ func (c *cmdFile) recursivePushFile(d lxd.ContainerServer, container string, sou
 					Handler: func(percent int64, speed int64) {
 						progress.UpdateProgress(ioprogress.ProgressData{
 							Text: fmt.Sprintf("%d%% (%s/s)", percent,
-								shared.GetByteSizeString(speed, 2))})
+								units.GetByteSizeString(speed, 2))})
 					},
 				},
 			}, args.Content)

@@ -16,90 +16,103 @@ import (
 	log "github.com/lxc/lxd/shared/log15"
 )
 
-var containersCmd = Command{
-	name: "containers",
-	get:  containersGet,
-	post: containersPost,
+var containersCmd = APIEndpoint{
+	Name: "containers",
+
+	Get:  APIEndpointAction{Handler: containersGet, AccessHandler: AllowProjectPermission("containers", "view")},
+	Post: APIEndpointAction{Handler: containersPost, AccessHandler: AllowProjectPermission("containers", "manage-containers")},
 }
 
-var containerCmd = Command{
-	name:   "containers/{name}",
-	get:    containerGet,
-	put:    containerPut,
-	delete: containerDelete,
-	post:   containerPost,
-	patch:  containerPatch,
+var containerCmd = APIEndpoint{
+	Name: "containers/{name}",
+
+	Get:    APIEndpointAction{Handler: containerGet, AccessHandler: AllowProjectPermission("containers", "view")},
+	Put:    APIEndpointAction{Handler: containerPut, AccessHandler: AllowProjectPermission("containers", "manage-containers")},
+	Delete: APIEndpointAction{Handler: containerDelete, AccessHandler: AllowProjectPermission("containers", "manage-containers")},
+	Post:   APIEndpointAction{Handler: containerPost, AccessHandler: AllowProjectPermission("containers", "manage-containers")},
+	Patch:  APIEndpointAction{Handler: containerPatch, AccessHandler: AllowProjectPermission("containers", "manage-containers")},
 }
 
-var containerStateCmd = Command{
-	name: "containers/{name}/state",
-	get:  containerState,
-	put:  containerStatePut,
+var containerStateCmd = APIEndpoint{
+	Name: "containers/{name}/state",
+
+	Get: APIEndpointAction{Handler: containerState, AccessHandler: AllowProjectPermission("containers", "view")},
+	Put: APIEndpointAction{Handler: containerStatePut, AccessHandler: AllowProjectPermission("containers", "operate-containers")},
 }
 
-var containerFileCmd = Command{
-	name:   "containers/{name}/files",
-	get:    containerFileHandler,
-	post:   containerFileHandler,
-	delete: containerFileHandler,
+var containerFileCmd = APIEndpoint{
+	Name: "containers/{name}/files",
+
+	Get:    APIEndpointAction{Handler: containerFileHandler, AccessHandler: AllowProjectPermission("containers", "operate-containers")},
+	Post:   APIEndpointAction{Handler: containerFileHandler, AccessHandler: AllowProjectPermission("containers", "operate-containers")},
+	Delete: APIEndpointAction{Handler: containerFileHandler, AccessHandler: AllowProjectPermission("containers", "operate-containers")},
 }
 
-var containerSnapshotsCmd = Command{
-	name: "containers/{name}/snapshots",
-	get:  containerSnapshotsGet,
-	post: containerSnapshotsPost,
+var containerSnapshotsCmd = APIEndpoint{
+	Name: "containers/{name}/snapshots",
+
+	Get:  APIEndpointAction{Handler: containerSnapshotsGet, AccessHandler: AllowProjectPermission("containers", "view")},
+	Post: APIEndpointAction{Handler: containerSnapshotsPost, AccessHandler: AllowProjectPermission("containers", "operate-containers")},
 }
 
-var containerSnapshotCmd = Command{
-	name:   "containers/{name}/snapshots/{snapshotName}",
-	get:    snapshotHandler,
-	post:   snapshotHandler,
-	delete: snapshotHandler,
-	put:    snapshotHandler,
+var containerSnapshotCmd = APIEndpoint{
+	Name: "containers/{name}/snapshots/{snapshotName}",
+
+	Get:    APIEndpointAction{Handler: containerSnapshotHandler, AccessHandler: AllowProjectPermission("containers", "operate-containers")},
+	Post:   APIEndpointAction{Handler: containerSnapshotHandler, AccessHandler: AllowProjectPermission("containers", "operate-containers")},
+	Delete: APIEndpointAction{Handler: containerSnapshotHandler, AccessHandler: AllowProjectPermission("containers", "operate-containers")},
+	Put:    APIEndpointAction{Handler: containerSnapshotHandler, AccessHandler: AllowProjectPermission("containers", "operate-containers")},
 }
 
-var containerConsoleCmd = Command{
-	name:   "containers/{name}/console",
-	get:    containerConsoleLogGet,
-	post:   containerConsolePost,
-	delete: containerConsoleLogDelete,
+var containerConsoleCmd = APIEndpoint{
+	Name: "containers/{name}/console",
+
+	Get:    APIEndpointAction{Handler: containerConsoleLogGet, AccessHandler: AllowProjectPermission("containers", "view")},
+	Post:   APIEndpointAction{Handler: containerConsolePost, AccessHandler: AllowProjectPermission("containers", "operate-containers")},
+	Delete: APIEndpointAction{Handler: containerConsoleLogDelete, AccessHandler: AllowProjectPermission("containers", "operate-containers")},
 }
 
-var containerExecCmd = Command{
-	name: "containers/{name}/exec",
-	post: containerExecPost,
+var containerExecCmd = APIEndpoint{
+	Name: "containers/{name}/exec",
+
+	Post: APIEndpointAction{Handler: containerExecPost, AccessHandler: AllowProjectPermission("containers", "operate-containers")},
 }
 
-var containerMetadataCmd = Command{
-	name: "containers/{name}/metadata",
-	get:  containerMetadataGet,
-	put:  containerMetadataPut,
+var containerMetadataCmd = APIEndpoint{
+	Name: "containers/{name}/metadata",
+
+	Get: APIEndpointAction{Handler: containerMetadataGet, AccessHandler: AllowProjectPermission("containers", "view")},
+	Put: APIEndpointAction{Handler: containerMetadataPut, AccessHandler: AllowProjectPermission("containers", "manage-containers")},
 }
 
-var containerMetadataTemplatesCmd = Command{
-	name:   "containers/{name}/metadata/templates",
-	get:    containerMetadataTemplatesGet,
-	post:   containerMetadataTemplatesPostPut,
-	put:    containerMetadataTemplatesPostPut,
-	delete: containerMetadataTemplatesDelete,
+var containerMetadataTemplatesCmd = APIEndpoint{
+	Name: "containers/{name}/metadata/templates",
+
+	Get:    APIEndpointAction{Handler: containerMetadataTemplatesGet, AccessHandler: AllowProjectPermission("containers", "view")},
+	Post:   APIEndpointAction{Handler: containerMetadataTemplatesPostPut, AccessHandler: AllowProjectPermission("containers", "manage-containers")},
+	Put:    APIEndpointAction{Handler: containerMetadataTemplatesPostPut, AccessHandler: AllowProjectPermission("containers", "manage-containers")},
+	Delete: APIEndpointAction{Handler: containerMetadataTemplatesDelete, AccessHandler: AllowProjectPermission("containers", "manage-containers")},
 }
 
-var containerBackupsCmd = Command{
-	name: "containers/{name}/backups",
-	get:  containerBackupsGet,
-	post: containerBackupsPost,
+var containerBackupsCmd = APIEndpoint{
+	Name: "containers/{name}/backups",
+
+	Get:  APIEndpointAction{Handler: containerBackupsGet, AccessHandler: AllowProjectPermission("containers", "view")},
+	Post: APIEndpointAction{Handler: containerBackupsPost, AccessHandler: AllowProjectPermission("containers", "operate-containers")},
 }
 
-var containerBackupCmd = Command{
-	name:   "containers/{name}/backups/{backupName}",
-	get:    containerBackupGet,
-	post:   containerBackupPost,
-	delete: containerBackupDelete,
+var containerBackupCmd = APIEndpoint{
+	Name: "containers/{name}/backups/{backupName}",
+
+	Get:    APIEndpointAction{Handler: containerBackupGet, AccessHandler: AllowProjectPermission("containers", "view")},
+	Post:   APIEndpointAction{Handler: containerBackupPost, AccessHandler: AllowProjectPermission("containers", "operate-containers")},
+	Delete: APIEndpointAction{Handler: containerBackupDelete, AccessHandler: AllowProjectPermission("containers", "operate-containers")},
 }
 
-var containerBackupExportCmd = Command{
-	name: "containers/{name}/backups/{backupName}/export",
-	get:  containerBackupExportGet,
+var containerBackupExportCmd = APIEndpoint{
+	Name: "containers/{name}/backups/{backupName}/export",
+
+	Get: APIEndpointAction{Handler: containerBackupExportGet, AccessHandler: AllowProjectPermission("containers", "view")},
 }
 
 type containerAutostartList []container
@@ -191,6 +204,34 @@ func (slice containerStopList) Swap(i, j int) {
 	slice[i], slice[j] = slice[j], slice[i]
 }
 
+// Return the names of all local containers, grouped by project. The
+// information is obtained by reading the data directory.
+func containersOnDisk() (map[string][]string, error) {
+	containers := map[string][]string{}
+
+	files, err := ioutil.ReadDir(shared.VarPath("containers"))
+	if err != nil {
+		return nil, err
+	}
+
+	for _, file := range files {
+		name := file.Name()
+		project := "default"
+		if strings.Contains(name, "_") {
+			fields := strings.Split(file.Name(), "_")
+			project = fields[0]
+			name = fields[1]
+		}
+		names, ok := containers[project]
+		if !ok {
+			names = []string{}
+		}
+		containers[project] = append(names, name)
+	}
+
+	return containers, nil
+}
+
 func containersShutdown(s *state.State) error {
 	var wg sync.WaitGroup
 
@@ -204,30 +245,24 @@ func containersShutdown(s *state.State) error {
 		containers = []container{}
 
 		// List all containers on disk
-		files, err := ioutil.ReadDir(shared.VarPath("containers"))
+		cnames, err := containersOnDisk()
 		if err != nil {
 			return err
 		}
 
-		for _, file := range files {
-			project := "default"
-			name := file.Name()
-			if strings.Contains(name, "_") {
-				fields := strings.Split(file.Name(), "_")
-				project = fields[0]
-				name = fields[1]
-			}
+		for project, names := range cnames {
+			for _, name := range names {
+				c, err := containerLXCLoad(s, db.ContainerArgs{
+					Project: project,
+					Name:    name,
+					Config:  make(map[string]string),
+				}, nil)
+				if err != nil {
+					return err
+				}
 
-			c, err := containerLXCLoad(s, db.ContainerArgs{
-				Project: project,
-				Name:    name,
-				Config:  make(map[string]string),
-			}, nil)
-			if err != nil {
-				return err
+				containers = append(containers, c)
 			}
-
-			containers = append(containers, c)
 		}
 	}
 
@@ -241,7 +276,7 @@ func containersShutdown(s *state.State) error {
 		}
 	}
 
-	var lastPriority int = 0
+	var lastPriority int
 
 	if len(containers) != 0 {
 		lastPriority, _ = strconv.Atoi(containers[0].ExpandedConfig()["boot.stop.priority"])
@@ -277,12 +312,12 @@ func containersShutdown(s *state.State) error {
 			go func(c container, lastState string) {
 				c.Shutdown(time.Second * time.Duration(timeoutSeconds))
 				c.Stop(false)
-				c.ConfigKeySet("volatile.last_state.power", lastState)
+				c.VolatileSet(map[string]string{"volatile.last_state.power": lastState})
 
 				wg.Done()
 			}(c, lastState)
 		} else {
-			c.ConfigKeySet("volatile.last_state.power", lastState)
+			c.VolatileSet(map[string]string{"volatile.last_state.power": lastState})
 		}
 	}
 	wg.Wait()
@@ -300,15 +335,15 @@ func containerDeleteSnapshots(s *state.State, project, cname string) error {
 		sc, err := containerLoadByProjectAndName(s, project, sname)
 		if err != nil {
 			logger.Error(
-				"containerDeleteSnapshots: Failed to load the snapshotcontainer",
-				log.Ctx{"container": cname, "snapshot": sname})
+				"containerDeleteSnapshots: Failed to load the snapshot container",
+				log.Ctx{"container": cname, "snapshot": sname, "err": err})
 
 			continue
 		}
 
 		if err := sc.Delete(); err != nil {
 			logger.Error(
-				"containerDeleteSnapshots: Failed to delete a snapshotcontainer",
+				"containerDeleteSnapshots: Failed to delete a snapshot container",
 				log.Ctx{"container": cname, "snapshot": sname, "err": err})
 		}
 	}

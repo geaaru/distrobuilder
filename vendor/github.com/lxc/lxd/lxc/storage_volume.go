@@ -7,9 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 
-	"github.com/olekukonko/tablewriter"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v2"
 
@@ -836,7 +834,7 @@ func (c *cmdStorageVolumeEdit) Run(cmd *cobra.Command, args []string) error {
 	}
 
 	// If stdin isn't a terminal, read text from it
-	if !termios.IsTerminal(int(syscall.Stdin)) {
+	if !termios.IsTerminal(getStdinFd()) {
 		contents, err := ioutil.ReadAll(os.Stdin)
 		if err != nil {
 			return err
@@ -1059,6 +1057,8 @@ type cmdStorageVolumeList struct {
 	global        *cmdGlobal
 	storage       *cmdStorage
 	storageVolume *cmdStorageVolume
+
+	flagFormat string
 }
 
 func (c *cmdStorageVolumeList) Command() *cobra.Command {
@@ -1068,6 +1068,7 @@ func (c *cmdStorageVolumeList) Command() *cobra.Command {
 	cmd.Short = i18n.G("List storage volumes")
 	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
 		`List storage volumes`))
+	cmd.Flags().StringVar(&c.flagFormat, "format", "table", i18n.G("Format (csv|json|table|yaml)")+"``")
 
 	cmd.RunE = c.Run
 
@@ -1110,11 +1111,8 @@ func (c *cmdStorageVolumeList) Run(cmd *cobra.Command, args []string) error {
 		}
 		data = append(data, entry)
 	}
+	sort.Sort(byNameAndType(data))
 
-	table := tablewriter.NewWriter(os.Stdout)
-	table.SetAutoWrapText(false)
-	table.SetAlignment(tablewriter.ALIGN_LEFT)
-	table.SetRowLine(true)
 	header := []string{
 		i18n.G("TYPE"),
 		i18n.G("NAME"),
@@ -1124,12 +1122,8 @@ func (c *cmdStorageVolumeList) Run(cmd *cobra.Command, args []string) error {
 	if resource.server.IsClustered() {
 		header = append(header, i18n.G("LOCATION"))
 	}
-	table.SetHeader(header)
-	sort.Sort(byNameAndType(data))
-	table.AppendBulk(data)
-	table.Render()
 
-	return nil
+	return renderTable(c.flagFormat, header, data, volumes)
 }
 
 // Move
@@ -1220,7 +1214,7 @@ func (c *cmdStorageVolumeRename) Run(cmd *cobra.Command, args []string) error {
 	if isSnapshot {
 		// Create the storage volume entry
 		vol := api.StorageVolumeSnapshotPost{}
-		vol.Name = args[2]
+		vol.Name = shared.ExtractSnapshotName(args[2])
 
 		// If a target member was specified, get the volume with the matching
 		// name on that member, if any.
@@ -1277,10 +1271,13 @@ type cmdStorageVolumeSet struct {
 
 func (c *cmdStorageVolumeSet) Command() *cobra.Command {
 	cmd := &cobra.Command{}
-	cmd.Use = i18n.G("set [<remote>:]<pool> <volume> <key> <value>")
+	cmd.Use = i18n.G("set [<remote>:]<pool> <volume> <key>=<value>...")
 	cmd.Short = i18n.G("Set storage volume configuration keys")
 	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
-		`Set storage volume configuration keys`))
+		`Set storage volume configuration keys
+
+For backward compatibility, a single configuration key may still be set with:
+    lxc storage volume set [<remote>:]<pool> <volume> <key> <value>`))
 
 	cmd.Flags().StringVar(&c.storage.flagTarget, "target", "", i18n.G("Cluster member name")+"``")
 	cmd.RunE = c.Run
@@ -1290,7 +1287,7 @@ func (c *cmdStorageVolumeSet) Command() *cobra.Command {
 
 func (c *cmdStorageVolumeSet) Run(cmd *cobra.Command, args []string) error {
 	// Sanity checks
-	exit, err := c.global.CheckArgs(cmd, args, 4, 4)
+	exit, err := c.global.CheckArgs(cmd, args, 3, -1)
 	if exit {
 		return err
 	}
@@ -1302,7 +1299,6 @@ func (c *cmdStorageVolumeSet) Run(cmd *cobra.Command, args []string) error {
 	}
 
 	resource := resources[0]
-
 	if resource.name == "" {
 		return fmt.Errorf(i18n.G("Missing pool name"))
 	}
@@ -1323,20 +1319,17 @@ func (c *cmdStorageVolumeSet) Run(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Get the value
-	key := args[2]
-	value := args[3]
-
-	if !termios.IsTerminal(int(syscall.Stdin)) && value == "-" {
-		buf, err := ioutil.ReadAll(os.Stdin)
-		if err != nil {
-			return fmt.Errorf(i18n.G("Can't read from stdin: %s"), err)
-		}
-		value = string(buf[:])
+	// Get the values
+	keys, err := getConfig(args[2:]...)
+	if err != nil {
+		return err
 	}
 
 	// Update the volume
-	vol.Config[key] = value
+	for k, v := range keys {
+		vol.Config[k] = v
+	}
+
 	err = client.UpdateStoragePoolVolume(resource.name, vol.Type, vol.Name, vol.Writable(), etag)
 	if err != nil {
 		return err

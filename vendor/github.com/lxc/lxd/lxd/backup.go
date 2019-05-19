@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/net/context"
+	"context"
 	"gopkg.in/yaml.v2"
 
 	"github.com/lxc/lxd/lxd/cluster"
@@ -149,8 +149,8 @@ func (b *backup) Delete() error {
 func (b *backup) Render() *api.ContainerBackup {
 	return &api.ContainerBackup{
 		Name:             strings.SplitN(b.name, "/", 2)[1],
-		CreationDate:     b.creationDate,
-		ExpiryDate:       b.expiryDate,
+		CreatedAt:        b.creationDate,
+		ExpiresAt:        b.expiryDate,
 		ContainerOnly:    b.containerOnly,
 		OptimizedStorage: b.optimizedStorage,
 	}
@@ -344,7 +344,7 @@ func backupCreateTarball(s *state.State, path string, backup backup) error {
 		}
 
 		for _, snap := range snaps {
-			_, snapName, _ := containerGetParentAndSnapshotName(snap.Name())
+			_, snapName, _ := shared.ContainerGetParentAndSnapshotName(snap.Name())
 			indexFile.Snapshots = append(indexFile.Snapshots, snapName)
 		}
 	}
@@ -385,7 +385,7 @@ func backupCreateTarball(s *state.State, path string, backup backup) error {
 		os.RemoveAll(backupPath)
 	}()
 
-	args := []string{"-cf", backupPath, "--xattrs", "-C", path, "--transform", "s,^./,backup/,", "."}
+	args := []string{"-cf", backupPath, "--numeric-owner", "--xattrs", "-C", path, "--transform", "s,^./,backup/,", "."}
 	_, err = shared.RunCommand("tar", args...)
 	if err != nil {
 		return err
@@ -489,7 +489,7 @@ func pruneExpiredContainerBackups(ctx context.Context, d *Daemon) error {
 	}
 
 	for _, backup := range backups {
-		containerName, _, _ := containerGetParentAndSnapshotName(backup)
+		containerName, _, _ := shared.ContainerGetParentAndSnapshotName(backup)
 		err := doBackupDelete(d.State(), backup, containerName)
 		if err != nil {
 			return errors.Wrapf(err, "Error deleting container backup %s", backup)

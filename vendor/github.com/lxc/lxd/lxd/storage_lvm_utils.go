@@ -8,19 +8,23 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/pkg/errors"
+
 	"github.com/lxc/lxd/lxd/db"
+	"github.com/lxc/lxd/lxd/project"
 	"github.com/lxc/lxd/lxd/state"
+	driver "github.com/lxc/lxd/lxd/storage"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/logger"
+	"github.com/lxc/lxd/shared/units"
 	"github.com/lxc/lxd/shared/version"
-	"github.com/pkg/errors"
 )
 
 func (s *storageLvm) lvExtend(lvPath string, lvSize int64, fsType string, fsMntPoint string, volumeType int, data interface{}) error {
 	// Round the size to closest 512 bytes
 	lvSize = int64(lvSize/512) * 512
-	lvSizeString := shared.GetByteSizeString(lvSize, 0)
+	lvSizeString := units.GetByteSizeString(lvSize, 0)
 
 	msg, err := shared.TryRunCommand(
 		"lvextend",
@@ -55,7 +59,7 @@ func (s *storageLvm) lvExtend(lvPath string, lvSize int64, fsType string, fsMntP
 			`volume type %d`, volumeType)
 	}
 
-	return growFileSystem(fsType, lvPath, fsMntPoint)
+	return driver.GrowFileSystem(fsType, lvPath, fsMntPoint)
 }
 
 func (s *storageLvm) lvReduce(lvPath string, lvSize int64, fsType string, fsMntPoint string, volumeType int, data interface{}) error {
@@ -64,7 +68,7 @@ func (s *storageLvm) lvReduce(lvPath string, lvSize int64, fsType string, fsMntP
 
 	// Round the size to closest 512 bytes
 	lvSize = int64(lvSize/512) * 512
-	lvSizeString := shared.GetByteSizeString(lvSize, 0)
+	lvSizeString := units.GetByteSizeString(lvSize, 0)
 
 	cleanupFunc, err := shrinkVolumeFilesystem(s, volumeType, fsType, lvPath, fsMntPoint, lvSize, data)
 	if cleanupFunc != nil {
@@ -117,14 +121,14 @@ func (s *storageLvm) getLvmFilesystem() string {
 }
 
 func (s *storageLvm) getLvmVolumeSize() (string, error) {
-	sz, err := shared.ParseByteSizeString(s.volume.Config["size"])
+	sz, err := units.ParseByteSizeString(s.volume.Config["size"])
 	if err != nil {
 		return "", err
 	}
 
 	// Safety net: Set to default value.
 	if sz == 0 {
-		sz, _ = shared.ParseByteSizeString("10GB")
+		sz, _ = units.ParseByteSizeString("10GB")
 	}
 
 	return fmt.Sprintf("%d", sz), nil
@@ -214,13 +218,13 @@ func (s *storageLvm) createSnapshotLV(project, vgName string, origLvName string,
 		}
 
 		// Round the size to closest 512 bytes
-		lvSizeInt, err := shared.ParseByteSizeString(lvSize)
+		lvSizeInt, err := units.ParseByteSizeString(lvSize)
 		if err != nil {
 			return "", err
 		}
 
 		lvSizeInt = int64(lvSizeInt/512) * 512
-		lvSizeString := shared.GetByteSizeString(lvSizeInt, 0)
+		lvSizeString := units.GetByteSizeString(lvSizeInt, 0)
 
 		args = append(args, "--size", lvSizeString)
 	}
@@ -280,14 +284,14 @@ func (s *storageLvm) createSnapshotContainer(snapshotContainer container, source
 		return errors.Wrap(err, "Get snapshot storage pool")
 	}
 	if targetIsSnapshot {
-		targetContainerMntPoint = getSnapshotMountPoint(sourceContainer.Project(), s.pool.Name, targetContainerName)
-		sourceName, _, _ := containerGetParentAndSnapshotName(sourceContainerName)
-		snapshotMntPointSymlinkTarget := shared.VarPath("storage-pools", s.pool.Name, "containers-snapshots", projectPrefix(sourceContainer.Project(), sourceName))
-		snapshotMntPointSymlink := shared.VarPath("snapshots", projectPrefix(sourceContainer.Project(), sourceName))
-		err = createSnapshotMountpoint(targetContainerMntPoint, snapshotMntPointSymlinkTarget, snapshotMntPointSymlink)
+		targetContainerMntPoint = driver.GetSnapshotMountPoint(sourceContainer.Project(), s.pool.Name, targetContainerName)
+		sourceName, _, _ := shared.ContainerGetParentAndSnapshotName(sourceContainerName)
+		snapshotMntPointSymlinkTarget := shared.VarPath("storage-pools", s.pool.Name, "containers-snapshots", project.Prefix(sourceContainer.Project(), sourceName))
+		snapshotMntPointSymlink := shared.VarPath("snapshots", project.Prefix(sourceContainer.Project(), sourceName))
+		err = driver.CreateSnapshotMountpoint(targetContainerMntPoint, snapshotMntPointSymlinkTarget, snapshotMntPointSymlink)
 	} else {
-		targetContainerMntPoint = getContainerMountPoint(sourceContainer.Project(), targetPool, targetContainerName)
-		err = createContainerMountpoint(targetContainerMntPoint, targetContainerPath, snapshotContainer.IsPrivileged())
+		targetContainerMntPoint = driver.GetContainerMountPoint(sourceContainer.Project(), targetPool, targetContainerName)
+		err = driver.CreateContainerMountpoint(targetContainerMntPoint, targetContainerPath, snapshotContainer.IsPrivileged())
 	}
 	if err != nil {
 		return errors.Wrap(err, "Create mount point")
@@ -328,7 +332,7 @@ func (s *storageLvm) copyContainerThinpool(target container, source container, r
 		}
 	}
 
-	msg, err := fsGenerateNewUUID(LVFilesystem, containerLvDevPath)
+	msg, err := driver.FSGenerateNewUUID(LVFilesystem, containerLvDevPath)
 	if err != nil {
 		logger.Errorf("Failed to create new \"%s\" UUID for container \"%s\" on storage pool \"%s\": %s", LVFilesystem, containerName, s.pool.Name, msg)
 		return err
@@ -343,11 +347,11 @@ func (s *storageLvm) copySnapshot(target container, source container, refresh bo
 		return err
 	}
 
-	targetParentName, _, _ := containerGetParentAndSnapshotName(target.Name())
-	containersPath := getSnapshotMountPoint(target.Project(), s.pool.Name, targetParentName)
-	snapshotMntPointSymlinkTarget := shared.VarPath("storage-pools", s.pool.Name, "containers-snapshots", projectPrefix(target.Project(), targetParentName))
-	snapshotMntPointSymlink := shared.VarPath("snapshots", projectPrefix(target.Project(), targetParentName))
-	err = createSnapshotMountpoint(containersPath, snapshotMntPointSymlinkTarget, snapshotMntPointSymlink)
+	targetParentName, _, _ := shared.ContainerGetParentAndSnapshotName(target.Name())
+	containersPath := driver.GetSnapshotMountPoint(target.Project(), s.pool.Name, targetParentName)
+	snapshotMntPointSymlinkTarget := shared.VarPath("storage-pools", s.pool.Name, "containers-snapshots", project.Prefix(target.Project(), targetParentName))
+	snapshotMntPointSymlink := shared.VarPath("snapshots", project.Prefix(target.Project(), targetParentName))
+	err = driver.CreateSnapshotMountpoint(containersPath, snapshotMntPointSymlinkTarget, snapshotMntPointSymlink)
 	if err != nil {
 		return err
 	}
@@ -403,14 +407,14 @@ func (s *storageLvm) copyContainerLv(target container, source container, readonl
 	if err != nil {
 		return err
 	}
-	sourceContainerMntPoint := getContainerMountPoint(source.Project(), sourcePool, sourceName)
+	sourceContainerMntPoint := driver.GetContainerMountPoint(source.Project(), sourcePool, sourceName)
 	if source.IsSnapshot() {
-		sourceContainerMntPoint = getSnapshotMountPoint(source.Project(), sourcePool, sourceName)
+		sourceContainerMntPoint = driver.GetSnapshotMountPoint(source.Project(), sourcePool, sourceName)
 	}
 
-	targetContainerMntPoint := getContainerMountPoint(target.Project(), s.pool.Name, targetName)
+	targetContainerMntPoint := driver.GetContainerMountPoint(target.Project(), s.pool.Name, targetName)
 	if target.IsSnapshot() {
-		targetContainerMntPoint = getSnapshotMountPoint(source.Project(), s.pool.Name, targetName)
+		targetContainerMntPoint = driver.GetSnapshotMountPoint(source.Project(), s.pool.Name, targetName)
 	}
 
 	if source.IsRunning() {
@@ -422,7 +426,7 @@ func (s *storageLvm) copyContainerLv(target container, source container, readonl
 	}
 
 	bwlimit := s.pool.Config["rsync.bwlimit"]
-	output, err := rsyncLocalCopy(sourceContainerMntPoint, targetContainerMntPoint, bwlimit)
+	output, err := rsyncLocalCopy(sourceContainerMntPoint, targetContainerMntPoint, bwlimit, true)
 	if err != nil {
 		return fmt.Errorf("failed to rsync container: %s: %s", string(output), err)
 	}
@@ -447,8 +451,8 @@ func (s *storageLvm) copyContainer(target container, source container, refresh b
 		return err
 	}
 
-	targetContainerMntPoint := getContainerMountPoint(target.Project(), targetPool, target.Name())
-	err = createContainerMountpoint(targetContainerMntPoint, target.Path(), target.IsPrivileged())
+	targetContainerMntPoint := driver.GetContainerMountPoint(target.Project(), targetPool, target.Name())
+	err = driver.CreateContainerMountpoint(targetContainerMntPoint, target.Path(), target.IsPrivileged())
 	if err != nil {
 		return err
 	}
@@ -498,7 +502,7 @@ func (s *storageLvm) containerCreateFromImageLv(c container, fp string) error {
 	logger.Debugf(`Mounted non-thinpool LVM storage volume for container "%s" on storage pool "%s"`, containerName, s.pool.Name)
 
 	imagePath := shared.VarPath("images", fp)
-	containerMntPoint := getContainerMountPoint(c.Project(), s.pool.Name, containerName)
+	containerMntPoint := driver.GetContainerMountPoint(c.Project(), s.pool.Name, containerName)
 	err = unpackImage(imagePath, containerMntPoint, storageTypeLvm, s.s.OS.RunningInUserNS, nil)
 	if err != nil {
 		logger.Errorf(`Failed to unpack image "%s" into non-thinpool LVM storage volume "%s" for container "%s" on storage pool "%s": %s`, imagePath, containerMntPoint, containerName, s.pool.Name, err)
@@ -593,7 +597,7 @@ func lvmLvIsWritable(lvName string) (bool, error) {
 func storageVGActivate(lvmVolumePath string) error {
 	output, err := shared.TryRunCommand("vgchange", "-ay", lvmVolumePath)
 	if err != nil {
-		return fmt.Errorf("could not activate volume group \"%s\": %s", lvmVolumePath, output)
+		return fmt.Errorf("could not activate volume group \"%s\": %s: %s", lvmVolumePath, output, err)
 	}
 
 	return nil
@@ -602,7 +606,7 @@ func storageVGActivate(lvmVolumePath string) error {
 func storageLVActivate(lvmVolumePath string) error {
 	output, err := shared.TryRunCommand("lvchange", "-ay", lvmVolumePath)
 	if err != nil {
-		return fmt.Errorf("could not activate logival volume \"%s\": %s", lvmVolumePath, output)
+		return fmt.Errorf("could not activate logival volume \"%s\": %s: %s", lvmVolumePath, output, err)
 	}
 
 	return nil
@@ -683,7 +687,7 @@ func lvmGetLVSize(lvPath string) (string, error) {
 		return "", err
 	}
 
-	detectedSize := shared.GetByteSizeString(size, 0)
+	detectedSize := units.GetByteSizeString(size, 0)
 
 	return detectedSize, nil
 }
@@ -801,8 +805,8 @@ func containerNameToLVName(containerName string) string {
 	return strings.Replace(lvName, shared.SnapshotDelimiter, "-", -1)
 }
 
-func getLvmDevPath(project, lvmPool string, volumeType string, lvmVolume string) string {
-	lvmVolume = projectPrefix(project, lvmVolume)
+func getLvmDevPath(projectName, lvmPool string, volumeType string, lvmVolume string) string {
+	lvmVolume = project.Prefix(projectName, lvmVolume)
 	if volumeType == "" {
 		return fmt.Sprintf("/dev/%s/%s", lvmPool, lvmVolume)
 	}
@@ -818,25 +822,25 @@ func getLVName(lvmPool string, volumeType string, lvmVolume string) string {
 	return fmt.Sprintf("%s/%s_%s", lvmPool, volumeType, lvmVolume)
 }
 
-func getPrefixedLvName(project, volumeType string, lvmVolume string) string {
-	lvmVolume = projectPrefix(project, lvmVolume)
+func getPrefixedLvName(projectName, volumeType string, lvmVolume string) string {
+	lvmVolume = project.Prefix(projectName, lvmVolume)
 	return fmt.Sprintf("%s_%s", volumeType, lvmVolume)
 }
 
-func lvmCreateLv(project, vgName string, thinPoolName string, lvName string, lvFsType string, lvSize string, volumeType string, makeThinLv bool) error {
+func lvmCreateLv(projectName, vgName string, thinPoolName string, lvName string, lvFsType string, lvSize string, volumeType string, makeThinLv bool) error {
 	var output string
 	var err error
 
 	// Round the size to closest 512 bytes
-	lvSizeInt, err := shared.ParseByteSizeString(lvSize)
+	lvSizeInt, err := units.ParseByteSizeString(lvSize)
 	if err != nil {
 		return err
 	}
 
 	lvSizeInt = int64(lvSizeInt/512) * 512
-	lvSizeString := shared.GetByteSizeString(lvSizeInt, 0)
+	lvSizeString := units.GetByteSizeString(lvSizeInt, 0)
 
-	lvmPoolVolumeName := getPrefixedLvName(project, volumeType, lvName)
+	lvmPoolVolumeName := getPrefixedLvName(projectName, volumeType, lvName)
 	if makeThinLv {
 		targetVg := fmt.Sprintf("%s/%s", vgName, thinPoolName)
 		output, err = shared.TryRunCommand("lvcreate", "-Wy", "--yes", "--thin", "-n", lvmPoolVolumeName, "--virtualsize", lvSizeString, targetVg)
@@ -848,9 +852,9 @@ func lvmCreateLv(project, vgName string, thinPoolName string, lvName string, lvF
 		return fmt.Errorf("Could not create thin LV named %s", lvmPoolVolumeName)
 	}
 
-	fsPath := getLvmDevPath(project, vgName, volumeType, lvName)
+	fsPath := getLvmDevPath(projectName, vgName, volumeType, lvName)
 
-	output, err = makeFSType(fsPath, lvFsType, nil)
+	output, err = driver.MakeFSType(fsPath, lvFsType, nil)
 	if err != nil {
 		logger.Errorf("Filesystem creation failed: %s", output)
 		return fmt.Errorf("Error making filesystem on image LV: %v", err)
@@ -948,7 +952,7 @@ func lvmVersionIsAtLeast(sTypeVersion string, versionString string) (bool, error
 
 // Copy an LVM custom volume.
 func (s *storageLvm) copyVolume(sourcePool string, source string) error {
-	targetMntPoint := getStoragePoolVolumeMountPoint(s.pool.Name, s.volume.Name)
+	targetMntPoint := driver.GetStoragePoolVolumeMountPoint(s.pool.Name, s.volume.Name)
 
 	err := os.MkdirAll(targetMntPoint, 0711)
 	if err != nil {
@@ -968,9 +972,9 @@ func (s *storageLvm) copyVolume(sourcePool string, source string) error {
 }
 
 func (s *storageLvm) copyVolumeSnapshot(sourcePool string, source string) error {
-	_, snapOnlyName, _ := containerGetParentAndSnapshotName(source)
+	_, snapOnlyName, _ := shared.ContainerGetParentAndSnapshotName(source)
 	target := fmt.Sprintf("%s/%s", s.volume.Name, snapOnlyName)
-	targetMntPoint := getStoragePoolVolumeSnapshotMountPoint(s.pool.Name, target)
+	targetMntPoint := driver.GetStoragePoolVolumeSnapshotMountPoint(s.pool.Name, target)
 
 	err := os.MkdirAll(targetMntPoint, 0711)
 	if err != nil {
@@ -996,18 +1000,18 @@ func (s *storageLvm) copyVolumeLv(sourcePool string, source string, target strin
 	sourceIsSnapshot := shared.IsSnapshot(source)
 
 	if sourceIsSnapshot {
-		srcMountPoint = getStoragePoolVolumeSnapshotMountPoint(sourcePool, source)
+		srcMountPoint = driver.GetStoragePoolVolumeSnapshotMountPoint(sourcePool, source)
 	} else {
-		srcMountPoint = getStoragePoolVolumeMountPoint(sourcePool, source)
+		srcMountPoint = driver.GetStoragePoolVolumeMountPoint(sourcePool, source)
 
 	}
 
 	targetIsSnapshot := shared.IsSnapshot(target)
 
 	if targetIsSnapshot {
-		dstMountPoint = getStoragePoolVolumeSnapshotMountPoint(s.pool.Name, target)
+		dstMountPoint = driver.GetStoragePoolVolumeSnapshotMountPoint(s.pool.Name, target)
 	} else {
-		dstMountPoint = getStoragePoolVolumeMountPoint(s.pool.Name, target)
+		dstMountPoint = driver.GetStoragePoolVolumeMountPoint(s.pool.Name, target)
 	}
 
 	var err error
@@ -1031,7 +1035,7 @@ func (s *storageLvm) copyVolumeLv(sourcePool string, source string, target strin
 	}
 
 	bwlimit := s.pool.Config["rsync.bwlimit"]
-	_, err = rsyncLocalCopy(srcMountPoint, dstMountPoint, bwlimit)
+	_, err = rsyncLocalCopy(srcMountPoint, dstMountPoint, bwlimit, true)
 	if err != nil {
 		os.RemoveAll(dstMountPoint)
 		logger.Errorf("Failed to rsync into LVM storage volume \"%s\" on storage pool \"%s\": %s", s.volume.Name, s.pool.Name, err)
@@ -1075,7 +1079,7 @@ func (s *storageLvm) copyVolumeThinpool(source string, target string, readOnly b
 
 	lvDevPath := getLvmDevPath("default", poolName, storagePoolVolumeAPIEndpointCustom, targetLvmName)
 
-	msg, err := fsGenerateNewUUID(lvFsType, lvDevPath)
+	msg, err := driver.FSGenerateNewUUID(lvFsType, lvDevPath)
 	if err != nil {
 		logger.Errorf("Failed to create new UUID for filesystem \"%s\" for RBD storage volume \"%s\" on storage pool \"%s\": %s: %s", lvFsType, s.volume.Name, s.pool.Name, msg, err)
 		return err

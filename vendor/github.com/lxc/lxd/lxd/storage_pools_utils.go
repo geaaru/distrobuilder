@@ -7,11 +7,12 @@ import (
 
 	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/lxd/state"
+	driver "github.com/lxc/lxd/lxd/storage"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/version"
 )
 
-var supportedPoolTypes = []string{"btrfs", "ceph", "dir", "lvm", "zfs"}
+var supportedPoolTypes = []string{"btrfs", "ceph", "cephfs", "dir", "lvm", "zfs"}
 
 func storagePoolUpdate(state *state.State, name, newDescription string, newConfig map[string]string, withDB bool) error {
 	s, err := storagePoolInit(state, name)
@@ -41,7 +42,7 @@ func storagePoolUpdate(state *state.State, name, newDescription string, newConfi
 		}
 	}()
 
-	changedConfig, userOnly := storageConfigDiff(oldConfig, newConfig)
+	changedConfig, userOnly := driver.ConfigDiff(oldConfig, newConfig)
 	// Apply config changes if there are any
 	if len(changedConfig) != 0 {
 		newWritable.Description = newDescription
@@ -110,7 +111,7 @@ func storagePoolUsedByGet(state *state.State, poolID int64, poolName string) ([]
 		switch apiEndpoint {
 		case storagePoolVolumeAPIEndpointContainers:
 			if strings.Index(volumes[i].Name, shared.SnapshotDelimiter) > 0 {
-				parentName, snapOnlyName, _ := containerGetParentAndSnapshotName(volumes[i].Name)
+				parentName, snapOnlyName, _ := shared.ContainerGetParentAndSnapshotName(volumes[i].Name)
 				poolUsedBy[i] = fmt.Sprintf("/%s/containers/%s/snapshots/%s", version.APIVersion, parentName, snapOnlyName)
 			} else {
 				poolUsedBy[i] = fmt.Sprintf("/%s/containers/%s", version.APIVersion, volumes[i].Name)
@@ -191,15 +192,15 @@ func storagePoolDBCreate(s *state.State, poolName, poolDescription string, drive
 	return nil
 }
 
-func storagePoolValidate(poolName string, driver string, config map[string]string) error {
+func storagePoolValidate(poolName string, driverName string, config map[string]string) error {
 	// Check if the storage pool name is valid.
-	err := storageValidName(poolName)
+	err := driver.ValidName(poolName)
 	if err != nil {
 		return err
 	}
 
 	// Validate the requested storage pool configuration.
-	err = storagePoolValidateConfig(poolName, driver, config, nil)
+	err = storagePoolValidateConfig(poolName, driverName, config, nil)
 	if err != nil {
 		return err
 	}
@@ -229,7 +230,7 @@ func storagePoolCreateInternal(state *state.State, poolName, poolDescription str
 }
 
 // This performs all non-db related work needed to create the pool.
-func doStoragePoolCreateInternal(state *state.State, poolName, poolDescription string, driver string, config map[string]string, isNotification bool) error {
+func doStoragePoolCreateInternal(state *state.State, poolName, poolDescription string, driverName string, config map[string]string, isNotification bool) error {
 	tryUndo := true
 	s, err := storagePoolInit(state, poolName)
 	if err != nil {
@@ -241,7 +242,7 @@ func doStoragePoolCreateInternal(state *state.State, poolName, poolDescription s
 	// done by the node that triggered this notification. We just need to
 	// create the storage pool directory.
 	if s, ok := s.(*storageCeph); ok && isNotification {
-		volumeMntPoint := getStoragePoolVolumeMountPoint(s.pool.Name, s.volume.Name)
+		volumeMntPoint := driver.GetStoragePoolVolumeMountPoint(s.pool.Name, s.volume.Name)
 		return os.MkdirAll(volumeMntPoint, 0711)
 
 	}
@@ -263,7 +264,7 @@ func doStoragePoolCreateInternal(state *state.State, poolName, poolDescription s
 	// callback. So diff the config here to see if something like this has
 	// happened.
 	postCreateConfig := s.GetStoragePoolWritable().Config
-	configDiff, _ := storageConfigDiff(config, postCreateConfig)
+	configDiff, _ := driver.ConfigDiff(config, postCreateConfig)
 	if len(configDiff) > 0 {
 		// Create the database entry for the storage pool.
 		err = state.Cluster.StoragePoolUpdate(poolName, poolDescription, postCreateConfig)

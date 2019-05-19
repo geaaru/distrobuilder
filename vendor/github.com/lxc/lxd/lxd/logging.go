@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"io/ioutil"
 	"os"
 	"time"
@@ -10,7 +11,6 @@ import (
 	"github.com/lxc/lxd/lxd/task"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/logger"
-	"golang.org/x/net/context"
 
 	log "github.com/lxc/lxd/shared/log15"
 )
@@ -115,7 +115,7 @@ func expireLogs(ctx context.Context, state *state.State) error {
 				if logfile.IsDir() {
 					newest := newestFile(path, logfile)
 					if time.Since(newest).Hours() >= 48 {
-						os.RemoveAll(path)
+						err := os.RemoveAll(path)
 						if err != nil {
 							return err
 						}

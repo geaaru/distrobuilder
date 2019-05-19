@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -11,51 +12,59 @@ import (
 	"strings"
 	"time"
 
-	"github.com/CanonicalLtd/go-dqlite"
+	dqlitedriver "github.com/canonical/go-dqlite/driver"
 	"github.com/gorilla/mux"
+	"github.com/pkg/errors"
+
 	lxd "github.com/lxc/lxd/client"
 	"github.com/lxc/lxd/lxd/cluster"
 	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/lxd/node"
+	storagedriver "github.com/lxc/lxd/lxd/storage"
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/logger"
 	"github.com/lxc/lxd/shared/version"
-	"github.com/pkg/errors"
 )
 
-var clusterCmd = Command{
-	name: "cluster",
-	get:  clusterGet,
-	put:  clusterPut,
+var clusterCmd = APIEndpoint{
+	Name: "cluster",
+
+	Get: APIEndpointAction{Handler: clusterGet, AccessHandler: AllowAuthenticated},
+	Put: APIEndpointAction{Handler: clusterPut},
 }
 
-var clusterNodesCmd = Command{
-	name: "cluster/members",
-	get:  clusterNodesGet,
+var clusterNodesCmd = APIEndpoint{
+	Name: "cluster/members",
+
+	Get: APIEndpointAction{Handler: clusterNodesGet, AccessHandler: AllowAuthenticated},
 }
 
-var clusterNodeCmd = Command{
-	name:   "cluster/members/{name}",
-	get:    clusterNodeGet,
-	post:   clusterNodePost,
-	delete: clusterNodeDelete,
+var clusterNodeCmd = APIEndpoint{
+	Name: "cluster/members/{name}",
+
+	Delete: APIEndpointAction{Handler: clusterNodeDelete},
+	Get:    APIEndpointAction{Handler: clusterNodeGet, AccessHandler: AllowAuthenticated},
+	Post:   APIEndpointAction{Handler: clusterNodePost},
 }
 
-var internalClusterAcceptCmd = Command{
-	name: "cluster/accept",
-	post: internalClusterPostAccept,
+var internalClusterAcceptCmd = APIEndpoint{
+	Name: "cluster/accept",
+
+	Post: APIEndpointAction{Handler: internalClusterPostAccept},
 }
 
-var internalClusterRebalanceCmd = Command{
-	name: "cluster/rebalance",
-	post: internalClusterPostRebalance,
+var internalClusterRebalanceCmd = APIEndpoint{
+	Name: "cluster/rebalance",
+
+	Post: APIEndpointAction{Handler: internalClusterPostRebalance},
 }
 
-var internalClusterPromoteCmd = Command{
-	name: "cluster/promote",
-	post: internalClusterPostPromote,
+var internalClusterPromoteCmd = APIEndpoint{
+	Name: "cluster/promote",
+
+	Post: APIEndpointAction{Handler: internalClusterPostPromote},
 }
 
 // Return information about the cluster.
@@ -486,7 +495,7 @@ func clusterPutJoin(d *Daemon, req api.ClusterPut) Response {
 			if err != nil {
 				return errors.Wrap(err, "failed to init ceph pool for joining node")
 			}
-			volumeMntPoint := getStoragePoolVolumeMountPoint(
+			volumeMntPoint := storagedriver.GetStoragePoolVolumeMountPoint(
 				name, storage.(*storageCeph).volume.Name)
 			err = os.MkdirAll(volumeMntPoint, 0711)
 			if err != nil {
@@ -522,15 +531,22 @@ func clusterPutJoin(d *Daemon, req api.ClusterPut) Response {
 			return err
 		}
 
-		// Connect to Candid
-		endpoint := clusterConfig.CandidEndpoint()
-		endpointKey := clusterConfig.CandidEndpointKey()
-		expiry := clusterConfig.CandidExpiry()
-		domains := clusterConfig.CandidDomains()
+		// Handle external authentication/RBAC
+		candidAPIURL, candidAPIKey, candidExpiry, candidDomains := clusterConfig.CandidServer()
+		rbacAPIURL, rbacAPIKey, rbacExpiry, rbacAgentURL, rbacAgentUsername, rbacAgentPrivateKey, rbacAgentPublicKey := clusterConfig.RBACServer()
 
-		err = d.setupExternalAuthentication(endpoint, endpointKey, expiry, domains)
-		if err != nil {
-			return err
+		if rbacAPIURL != "" {
+			err = d.setupRBACServer(rbacAPIURL, rbacAPIKey, rbacExpiry, rbacAgentURL, rbacAgentUsername, rbacAgentPrivateKey, rbacAgentPublicKey)
+			if err != nil {
+				return err
+			}
+		}
+
+		if candidAPIURL != "" {
+			err = d.setupExternalAuthentication(candidAPIURL, candidAPIKey, candidExpiry, candidDomains)
+			if err != nil {
+				return err
+			}
 		}
 
 		// Re-use the client handler and import the images from the leader node which
@@ -636,12 +652,13 @@ func clusterPutDisable(d *Daemon) Response {
 	if err != nil {
 		return SmartError(err)
 	}
-	store := d.gateway.ServerStore()
+	store := d.gateway.NodeStore()
 	d.cluster, err = db.OpenCluster(
 		"db.bin", store, address, "/unused/db/dir",
 		d.config.DqliteSetupTimeout,
-		dqlite.WithDialFunc(d.gateway.DialFunc()),
-		dqlite.WithContext(d.gateway.Context()),
+		nil,
+		dqlitedriver.WithDialFunc(d.gateway.DialFunc()),
+		dqlitedriver.WithContext(d.gateway.Context()),
 	)
 	if err != nil {
 		return SmartError(err)
@@ -929,7 +946,7 @@ func clusterNodeDelete(d *Daemon, r *http.Request) Response {
 		put.Enabled = false
 		_, err = client.UpdateCluster(put, "")
 		if err != nil {
-			SmartError(errors.Wrap(err, "failed to cleanup the node"))
+			return SmartError(errors.Wrap(err, "failed to cleanup the node"))
 		}
 	}
 
@@ -1068,8 +1085,41 @@ func internalClusterPostRebalance(d *Daemon, r *http.Request) Response {
 	if err != nil {
 		return SmartError(err)
 	}
+
 	if address == "" {
-		return SyncResponse(true, nil) // Nothing to change
+		// If no node could be found to promote, notify all nodes about current set of DB nodes
+		var offlineThreshold time.Duration
+		err := d.cluster.Transaction(func(tx *db.ClusterTx) error {
+			var err error
+
+			offlineThreshold, err = tx.NodeOfflineThreshold()
+			if err != nil {
+				return err
+			}
+
+			return nil
+		})
+		if err != nil {
+			return InternalError(err)
+		}
+
+		hbState := &cluster.APIHeartbeat{}
+		hbState.Update(false, nodes, []db.NodeInfo{}, offlineThreshold)
+
+		cert, err := util.LoadCert(d.os.VarDir)
+		if err != nil {
+			return InternalError(errors.Wrap(err, "failed to parse cluster certificate"))
+		}
+
+		for _, raftNode := range nodes {
+			if raftNode.Address == localAddress {
+				continue
+			}
+
+			go cluster.HeartbeatNode(context.Background(), raftNode.Address, cert, hbState)
+		}
+
+		return SyncResponse(true, nil)
 	}
 
 	// Tell the node to promote itself.

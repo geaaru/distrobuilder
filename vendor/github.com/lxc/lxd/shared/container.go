@@ -9,6 +9,8 @@ import (
 
 	"github.com/pkg/errors"
 	"gopkg.in/robfig/cron.v2"
+
+	"github.com/lxc/lxd/shared/units"
 )
 
 type ContainerAction string
@@ -105,10 +107,39 @@ func IsAny(value string) error {
 	return nil
 }
 
-// IsRootDiskDevice returns true if the given device representation is
-// configured as root disk for a container. It typically get passed a specific
-// entry of api.Container.Devices.
+func IsNotEmpty(value string) error {
+	if value == "" {
+		return fmt.Errorf("Required value")
+	}
+
+	return nil
+}
+
+// IsDeviceID validates string is four lowercase hex characters suitable as Vendor or Device ID.
+func IsDeviceID(value string) error {
+	if value == "" {
+		return nil
+	}
+
+	regexHexLc, err := regexp.Compile("^[0-9a-f]+$")
+	if err != nil {
+		return err
+	}
+
+	if len(value) != 4 || !regexHexLc.MatchString(value) {
+		return fmt.Errorf("Invalid value, must be four lower case hex characters")
+	}
+
+	return nil
+}
+
+// IsRootDiskDevice returns true if the given device representation is configured as root disk for
+// a container. It typically get passed a specific entry of api.Container.Devices.
 func IsRootDiskDevice(device map[string]string) bool {
+	// Root disk devices also need a non-empty "pool" property, but we can't check that here
+	// because this function is used with clients talking to older servers where there was no
+	// concept of a storage pool, and also it is used for migrating from old to new servers.
+	// The validation of the non-empty "pool" property is done inside the disk device itself.
 	if device["type"] == "disk" && device["path"] == "/" && device["source"] == "" {
 		return true
 	}
@@ -223,7 +254,7 @@ var KnownContainerConfigKeys = map[string]func(value string) error{
 			return nil
 		}
 
-		_, err := ParseByteSizeString(value)
+		_, err := units.ParseByteSizeString(value)
 		if err != nil {
 			return err
 		}
@@ -263,10 +294,12 @@ var KnownContainerConfigKeys = map[string]func(value string) error{
 	"security.idmap.isolated": IsBool,
 	"security.idmap.size":     IsUint32,
 
-	"security.syscalls.blacklist_default": IsBool,
-	"security.syscalls.blacklist_compat":  IsBool,
-	"security.syscalls.blacklist":         IsAny,
-	"security.syscalls.whitelist":         IsAny,
+	"security.syscalls.blacklist_default":  IsBool,
+	"security.syscalls.blacklist_compat":   IsBool,
+	"security.syscalls.blacklist":          IsAny,
+	"security.syscalls.intercept.mknod":    IsBool,
+	"security.syscalls.intercept.setxattr": IsBool,
+	"security.syscalls.whitelist":          IsAny,
 
 	"snapshots.schedule": func(value string) error {
 		if value == "" {
@@ -331,6 +364,26 @@ func ConfigKeyChecker(key string) (func(value string) error, error) {
 		if strings.HasSuffix(key, ".host_name") {
 			return IsAny, nil
 		}
+
+		if strings.HasSuffix(key, ".mtu") {
+			return IsAny, nil
+		}
+
+		if strings.HasSuffix(key, ".created") {
+			return IsAny, nil
+		}
+
+		if strings.HasSuffix(key, ".id") {
+			return IsAny, nil
+		}
+
+		if strings.HasSuffix(key, ".vlan") {
+			return IsAny, nil
+		}
+
+		if strings.HasSuffix(key, ".spoofcheck") {
+			return IsAny, nil
+		}
 	}
 
 	if strings.HasPrefix(key, "environment.") {
@@ -351,4 +404,15 @@ func ConfigKeyChecker(key string) (func(value string) error, error) {
 	}
 
 	return nil, fmt.Errorf("Unknown configuration key: %s", key)
+}
+
+// ContainerGetParentAndSnapshotName returns the parent container name, snapshot
+// name, and whether it actually was a snapshot name.
+func ContainerGetParentAndSnapshotName(name string) (string, string, bool) {
+	fields := strings.SplitN(name, SnapshotDelimiter, 2)
+	if len(fields) == 1 {
+		return name, "", false
+	}
+
+	return fields[0], fields[1], true
 }

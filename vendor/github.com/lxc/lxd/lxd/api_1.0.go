@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 
 	"gopkg.in/lxc/go-lxc.v2"
 
@@ -21,19 +22,16 @@ import (
 	"github.com/pkg/errors"
 )
 
-var api10Cmd = Command{
-	name:         "",
-	untrustedGet: true,
-	get:          api10Get,
-	put:          api10Put,
-	patch:        api10Patch,
+var api10Cmd = APIEndpoint{
+	Get:   APIEndpointAction{Handler: api10Get, AllowUntrusted: true},
+	Patch: APIEndpointAction{Handler: api10Patch},
+	Put:   APIEndpointAction{Handler: api10Put},
 }
 
-var api10 = []Command{
-	aliasCmd,
-	aliasesCmd,
+var api10 = []APIEndpoint{
 	api10Cmd,
-	certificateFingerprintCmd,
+	api10ResourcesCmd,
+	certificateCmd,
 	certificatesCmd,
 	clusterCmd,
 	clusterNodeCmd,
@@ -54,6 +52,8 @@ var api10 = []Command{
 	containerSnapshotsCmd,
 	containerStateCmd,
 	eventsCmd,
+	imageAliasCmd,
+	imageAliasesCmd,
 	imageCmd,
 	imageExportCmd,
 	imageRefreshCmd,
@@ -71,18 +71,16 @@ var api10 = []Command{
 	profilesCmd,
 	projectCmd,
 	projectsCmd,
-	serverResourceCmd,
-	serverResourceCmd,
 	storagePoolCmd,
 	storagePoolResourcesCmd,
 	storagePoolsCmd,
 	storagePoolVolumesCmd,
+	storagePoolVolumeSnapshotsTypeCmd,
+	storagePoolVolumeSnapshotTypeCmd,
 	storagePoolVolumesTypeCmd,
 	storagePoolVolumeTypeContainerCmd,
 	storagePoolVolumeTypeCustomCmd,
 	storagePoolVolumeTypeImageCmd,
-	storagePoolVolumeSnapshotsTypeCmd,
-	storagePoolVolumeSnapshotTypeCmd,
 }
 
 func api10Get(d *Daemon, r *http.Request) Response {
@@ -92,9 +90,13 @@ func api10Get(d *Daemon, r *http.Request) Response {
 		if err != nil {
 			return err
 		}
-		if config.CandidEndpoint() != "" {
+
+		candidURL, _, _, _ := config.CandidServer()
+		rbacURL, _, _, _, _, _, _ := config.RBACServer()
+		if candidURL != "" || rbacURL != "" {
 			authMethods = append(authMethods, "candid")
 		}
+
 		return nil
 	})
 	if err != nil {
@@ -205,7 +207,15 @@ func api10Get(d *Daemon, r *http.Request) Response {
 		"netnsid_getifaddrs": fmt.Sprintf("%v", d.os.NetnsGetifaddrs),
 		"uevent_injection":   fmt.Sprintf("%v", d.os.UeventInjection),
 		"unpriv_fscaps":      fmt.Sprintf("%v", d.os.VFS3Fscaps),
+		"seccomp_listener":   fmt.Sprintf("%v", d.os.SeccompListener),
 		"shiftfs":            fmt.Sprintf("%v", d.os.Shiftfs),
+	}
+
+	if d.os.LXCFeatures != nil {
+		env.LXCFeatures = map[string]string{}
+		for k, v := range d.os.LXCFeatures {
+			env.LXCFeatures[k] = fmt.Sprintf("%v", v)
+		}
 	}
 
 	drivers := readStoragePoolDriversCache()
@@ -311,6 +321,8 @@ func api10Patch(d *Daemon, r *http.Request) Response {
 }
 
 func doApi10Update(d *Daemon, req api.ServerPut, patch bool) Response {
+	s := d.State()
+
 	// First deal with config specific to the local daemon
 	nodeValues := map[string]interface{}{}
 
@@ -340,6 +352,21 @@ func doApi10Update(d *Daemon, req api.ServerPut, patch bool) Response {
 			return fmt.Errorf("Changing cluster.https_address is currently not supported")
 		}
 
+		// Validate the storage volumes
+		if nodeValues["storage.backups_volume"] != nil && nodeValues["storage.backups_volume"] != newNodeConfig.StorageBackupsVolume() {
+			err := daemonStorageValidate(s, nodeValues["storage.backups_volume"].(string))
+			if err != nil {
+				return err
+			}
+		}
+
+		if nodeValues["storage.images_volume"] != nil && nodeValues["storage.images_volume"] != newNodeConfig.StorageImagesVolume() {
+			err := daemonStorageValidate(s, nodeValues["storage.images_volume"].(string))
+			if err != nil {
+				return err
+			}
+		}
+
 		if patch {
 			nodeChanged, err = newNodeConfig.Patch(nodeValues)
 		} else {
@@ -353,6 +380,25 @@ func doApi10Update(d *Daemon, req api.ServerPut, patch bool) Response {
 			return BadRequest(err)
 		default:
 			return SmartError(err)
+		}
+	}
+
+	// Validate global configuration
+	hasRBAC := false
+	hasCandid := false
+	for k, v := range req.Config {
+		if v == "" {
+			continue
+		}
+
+		if strings.HasPrefix(k, "candid.") {
+			hasCandid = true
+		} else if strings.HasPrefix(k, "rbac.") {
+			hasRBAC = true
+		}
+
+		if hasCandid && hasRBAC {
+			return BadRequest(fmt.Errorf("RBAC and Candid are mutually exclusive"))
 		}
 	}
 
@@ -382,7 +428,7 @@ func doApi10Update(d *Daemon, req api.ServerPut, patch bool) Response {
 	}
 
 	// Notify the other nodes about changes
-	notifier, err := cluster.NewNotifier(d.State(), d.endpoints.NetworkCert(), cluster.NotifyAlive)
+	notifier, err := cluster.NewNotifier(s, d.endpoints.NetworkCert(), cluster.NotifyAlive)
 	if err != nil {
 		return SmartError(err)
 	}
@@ -413,8 +459,11 @@ func doApi10Update(d *Daemon, req api.ServerPut, patch bool) Response {
 }
 
 func doApi10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]string, nodeConfig *node.Config, clusterConfig *cluster.Config) error {
+	s := d.State()
+
 	maasChanged := false
 	candidChanged := false
+	rbacChanged := false
 
 	for key := range clusterChanged {
 		switch key {
@@ -444,6 +493,20 @@ func doApi10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 			if !d.os.MockMode {
 				d.taskPruneImages.Reset()
 			}
+		case "rbac.agent.url":
+			fallthrough
+		case "rbac.agent.username":
+			fallthrough
+		case "rbac.agent.private_key":
+			fallthrough
+		case "rbac.agent.public_key":
+			fallthrough
+		case "rbac.api.url":
+			fallthrough
+		case "rbac.api.key":
+			fallthrough
+		case "rbac.expiry":
+			rbacChanged = true
 		}
 	}
 
@@ -481,6 +544,22 @@ func doApi10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 		}
 	}
 
+	value, ok = nodeChanged["storage.backups_volume"]
+	if ok {
+		err := daemonStorageMove(s, "backups", value)
+		if err != nil {
+			return err
+		}
+	}
+
+	value, ok = nodeChanged["storage.images_volume"]
+	if ok {
+		err := daemonStorageMove(s, "images", value)
+		if err != nil {
+			return err
+		}
+	}
+
 	if maasChanged {
 		url, key := clusterConfig.MAASController()
 		machine := nodeConfig.MAASMachine()
@@ -491,12 +570,28 @@ func doApi10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 	}
 
 	if candidChanged {
-		endpoint := clusterConfig.CandidEndpoint()
-		endpointKey := clusterConfig.CandidEndpointKey()
-		expiry := clusterConfig.CandidExpiry()
-		domains := clusterConfig.CandidDomains()
+		apiURL, apiKey, expiry, domains := clusterConfig.CandidServer()
+		err := d.setupExternalAuthentication(apiURL, apiKey, expiry, domains)
+		if err != nil {
+			return err
+		}
+	}
 
-		err := d.setupExternalAuthentication(endpoint, endpointKey, expiry, domains)
+	if rbacChanged {
+		apiURL, apiKey, apiExpiry, agentURL, agentUsername, agentPrivateKey, agentPublicKey := clusterConfig.RBACServer()
+
+		// Since RBAC seems to have been set up already, we need to disable it temporarily
+		if d.rbac != nil {
+			err := d.setupExternalAuthentication("", "", 0, "")
+			if err != nil {
+				return err
+			}
+
+			d.rbac.StopStatusCheck()
+			d.rbac = nil
+		}
+
+		err := d.setupRBACServer(apiURL, apiKey, apiExpiry, agentURL, agentUsername, agentPrivateKey, agentPublicKey)
 		if err != nil {
 			return err
 		}
