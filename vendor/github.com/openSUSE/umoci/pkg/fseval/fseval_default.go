@@ -1,6 +1,6 @@
 /*
  * umoci: Umoci Modifies Open Containers' Images
- * Copyright (C) 2016, 2017, 2018 SUSE LLC.
+ * Copyright (C) 2016, 2017 SUSE LLC.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,7 +19,6 @@ package fseval
 
 import (
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/openSUSE/umoci/pkg/system"
@@ -108,9 +107,9 @@ func (fs osFsEval) Mkdir(path string, perm os.FileMode) error {
 	return os.Mkdir(path, perm)
 }
 
-// Mknod is equivalent to unix.Mknod.
-func (fs osFsEval) Mknod(path string, mode os.FileMode, dev uint64) error {
-	return unix.Mknod(path, uint32(mode), int(dev))
+// Mknod is equivalent to system.Mknod.
+func (fs osFsEval) Mknod(path string, mode os.FileMode, dev system.Dev_t) error {
+	return system.Mknod(path, mode, dev)
 }
 
 // MkdirAll is equivalent to os.MkdirAll.
@@ -139,16 +138,11 @@ func (fs osFsEval) Lgetxattr(path string, name string) ([]byte, error) {
 }
 
 // Lclearxattrs is equivalent to system.Lclearxattrs
-func (fs osFsEval) Lclearxattrs(path string, except map[string]struct{}) error {
-	return system.Lclearxattrs(path, except)
+func (fs osFsEval) Lclearxattrs(path string) error {
+	return system.Lclearxattrs(path)
 }
 
 // KeywordFunc returns a wrapper around the given mtree.KeywordFunc.
 func (fs osFsEval) KeywordFunc(fn mtree.KeywordFunc) mtree.KeywordFunc {
 	return fn
-}
-
-// Walk is equivalent to filepath.Walk.
-func (fs osFsEval) Walk(root string, fn filepath.WalkFunc) error {
-	return filepath.Walk(root, fn)
 }

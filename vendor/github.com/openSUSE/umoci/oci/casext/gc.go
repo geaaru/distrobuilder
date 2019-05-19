@@ -1,6 +1,6 @@
 /*
  * umoci: Umoci Modifies Open Containers' Images
- * Copyright (C) 2016, 2017, 2018 SUSE LLC.
+ * Copyright (C) 2016, 2017 SUSE LLC.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -49,9 +49,6 @@ func (e Engine) GC(ctx context.Context) error {
 		descriptorPaths, err := e.ResolveReference(ctx, name)
 		if err != nil {
 			return errors.Wrapf(err, "get root %s", name)
-		}
-		if len(descriptorPaths) == 0 {
-			return errors.Errorf("tag not found: %s", name)
 		}
 		if len(descriptorPaths) != 1 {
 			// TODO: Handle this more nicely.

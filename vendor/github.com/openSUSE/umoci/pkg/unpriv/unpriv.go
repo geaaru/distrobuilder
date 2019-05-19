@@ -1,6 +1,6 @@
 /*
  * umoci: Umoci Modifies Open Containers' Images
- * Copyright (C) 2016, 2017, 2018 SUSE LLC.
+ * Copyright (C) 2016, 2017 SUSE LLC.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,9 +19,9 @@ package unpriv
 
 import (
 	"archive/tar"
+	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -34,8 +34,6 @@ import (
 // fiRestore restores the state given by an os.FileInfo instance at the given
 // path by ensuring that an Lstat(path) will return as-close-to the same
 // os.FileInfo.
-//
-// #nosec G104
 func fiRestore(path string, fi os.FileInfo) {
 	// archive/tar handles the OS-specific syscall stuff required to get atime
 	// and mtime information for a file.
@@ -58,11 +56,6 @@ func splitpath(path string) []string {
 	return parts
 }
 
-// WrapFunc is a function that can be passed to Wrap. It takes a path (and
-// presumably operates on it -- since Wrap only ensures that the path given is
-// resolvable) and returns some form of error.
-type WrapFunc func(path string) error
-
 // Wrap will wrap a given function, and call it in a context where all of the
 // parent directories in the given path argument are such that the path can be
 // resolved (you may need to make your own changes to the path to make it
@@ -70,7 +63,7 @@ type WrapFunc func(path string) error
 // if the error returned is such that !os.IsPermission(err), then no trickery
 // will be performed. If fn returns an error, so will this function. All of the
 // trickery is reverted when this function returns (which is when fn returns).
-func Wrap(path string, fn WrapFunc) error {
+func Wrap(path string, fn func(path string) error) error {
 	// FIXME: Should we be calling fn() here first?
 	if err := fn(path); err == nil || !os.IsPermission(errors.Cause(err)) {
 		return err
@@ -306,57 +299,10 @@ func Remove(path string) error {
 	return errors.Wrap(Wrap(path, os.Remove), "unpriv.remove")
 }
 
-// foreachSubpath executes WrapFunc for each child of the given path (not
-// including the path itself). If path is not a directory, then WrapFunc will
-// not be called and no error will be returned. This should be called within a
-// context where path has already been made resolveable, however the . If WrapFunc returns an
-// error, the first error is returned and iteration is halted.
-func foreachSubpath(path string, wrapFn WrapFunc) error {
-	// Is the path a directory?
-	fi, err := os.Lstat(path)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	if !fi.IsDir() {
-		return nil
-	}
-
-	// Open the directory.
-	fd, err := Open(path)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	defer fd.Close()
-
-	// We need to change the mode to Readdirnames. We don't need to worry about
-	// permissions because we're already in a context with filepath.Dir(path)
-	// is at least a+rx. However, because we are calling wrapFn we need to
-	// restore the original mode immediately.
-	// #nosec G104
-	_ = os.Chmod(path, fi.Mode()|0444)
-	names, err := fd.Readdirnames(-1)
-	fiRestore(path, fi)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-
-	// Make iteration order consistent.
-	sort.Strings(names)
-
-	// Call on all the sub-directories. We run it in a Wrap context to ensure
-	// that the path we pass is resolveable when executed.
-	for _, name := range names {
-		subpath := filepath.Join(path, name)
-		if err := Wrap(subpath, wrapFn); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// RemoveAll is similar to os.RemoveAll but with all of the internal functions
-// wrapped with unpriv.Wrap to make it possible to remove a path (even if it
-// has child paths) even if you do not currently have enough access bits.
+// RemoveAll is similar to os.RemoveAll but in order to implement it properly
+// all of the internal functions were wrapped with unpriv.Wrap to make it
+// possible to remove a path (even if it has child paths) even if you do not
+// currently have enough access bits.
 func RemoveAll(path string) error {
 	return errors.Wrap(Wrap(path, func(path string) error {
 		// If remove works, we're done.
@@ -378,25 +324,49 @@ func RemoveAll(path string) error {
 		if !fi.IsDir() {
 			return errors.Wrap(err, "remove non-directory")
 		}
-		err = nil
 
-		err1 := foreachSubpath(path, func(subpath string) error {
-			err2 := RemoveAll(subpath)
-			if err == nil {
-				err = err2
+		// Open the directory.
+		fd, err := Open(path)
+		if err != nil {
+			// We hit a race, but don't worry about it.
+			if os.IsNotExist(errors.Cause(err)) {
+				err = nil
 			}
-			return nil
-		})
-		if err1 != nil {
-			// We must have hit a race, but we don't care.
-			if os.IsNotExist(errors.Cause(err1)) {
-				err1 = nil
-			}
-			return errors.Wrap(err1, "foreach subpath")
+			return errors.Wrap(err, "opendir")
 		}
 
+		// We need to change the mode to Readdirnames. We don't need to worry
+		// about permissions because we're already in a context with
+		// filepath.Dir(path) is writeable.
+		os.Chmod(path, fi.Mode()|0400)
+		defer fiRestore(path, fi)
+
+		// Remove contents recursively.
+		err = nil
+		for {
+			names, err1 := fd.Readdirnames(128)
+			for _, name := range names {
+				err1 := RemoveAll(filepath.Join(path, name))
+				if err == nil {
+					err = err1
+				}
+			}
+			if err1 == io.EOF {
+				break
+			}
+			if err == nil {
+				err = err1
+			}
+			if len(names) == 0 {
+				break
+			}
+		}
+
+		// Close the directory.
+		fd.Close()
+
 		// Remove the directory. This should now work.
-		err1 = os.Remove(path)
+		err1 := os.Remove(path)
 		if err1 == nil || os.IsNotExist(errors.Cause(err1)) {
 			return nil
 		}
@@ -453,12 +423,12 @@ func MkdirAll(path string, perm os.FileMode) error {
 	}), "unpriv.mkdirall")
 }
 
-// Mknod is a wrapper around unix.Mknod which has been wrapped with unpriv.Wrap
+// Mknod is a wrapper around os.Mknod which has been wrapped with unpriv.Wrap
 // to make it possible to remove a path even if you do not currently have the
 // required access bits to modify or resolve the path.
-func Mknod(path string, mode os.FileMode, dev uint64) error {
+func Mknod(path string, mode os.FileMode, dev system.Dev_t) error {
 	return errors.Wrap(Wrap(path, func(path string) error {
-		return unix.Mknod(path, uint32(mode), int(dev))
+		return system.Mknod(path, mode, dev)
 	}), "unpriv.mknod")
 }
 
@@ -510,16 +480,13 @@ func Lgetxattr(path, name string) ([]byte, error) {
 // properly all of the internal functions were wrapped with unpriv.Wrap to make
 // it possible to create a path even if you do not currently have enough access
 // bits.
-func Lclearxattrs(path string, except map[string]struct{}) error {
+func Lclearxattrs(path string) error {
 	return errors.Wrap(Wrap(path, func(path string) error {
 		names, err := Llistxattr(path)
 		if err != nil {
 			return err
 		}
 		for _, name := range names {
-			if _, skip := except[name]; skip {
-				continue
-			}
 			if err := Lremovexattr(path, name); err != nil {
 				// SELinux won't let you change security.selinux (for obvious
 				// security reasons), so we don't clear xattrs if attempting to
@@ -533,56 +500,4 @@ func Lclearxattrs(path string, except map[string]struct{}) error {
 		}
 		return nil
 	}), "unpriv.lclearxattrs")
-}
-
-// walk is the inner implementation of Walk.
-func walk(path string, info os.FileInfo, walkFn filepath.WalkFunc) error {
-	// Always run walkFn first. If we're not a directory there's no children to
-	// iterate over and so we bail even if there wasn't an error.
-	err := walkFn(path, info, nil)
-	if !info.IsDir() || err != nil {
-		return err
-	}
-
-	// Now just execute walkFn over each subpath.
-	return foreachSubpath(path, func(subpath string) error {
-		info, err := Lstat(subpath)
-		if err != nil {
-			// If it doesn't exist, just pass it directly to walkFn.
-			if err := walkFn(subpath, info, err); err != nil {
-				// Ignore SkipDir.
-				if errors.Cause(err) != filepath.SkipDir {
-					return err
-				}
-			}
-		} else {
-			if err := walk(subpath, info, walkFn); err != nil {
-				// Ignore error if it's SkipDir and subpath is a directory.
-				if !(info.IsDir() && errors.Cause(err) == filepath.SkipDir) {
-					return err
-				}
-			}
-		}
-		return nil
-	})
-}
-
-// Walk is a reimplementation of filepath.Walk, wrapping all of the relevant
-// function calls with Wrap, allowing you to walk over a tree even in the face
-// of multiple nested cases where paths are not normally accessible. The
-// os.FileInfo passed to walkFn is the "pristine" version (as opposed to the
-// currently-on-disk version that may have been temporarily modified by Wrap).
-func Walk(root string, walkFn filepath.WalkFunc) error {
-	return Wrap(root, func(root string) error {
-		info, err := Lstat(root)
-		if err != nil {
-			err = walkFn(root, nil, err)
-		} else {
-			err = walk(root, info, walkFn)
-		}
-		if errors.Cause(err) == filepath.SkipDir {
-			err = nil
-		}
-		return errors.Wrap(err, "unpriv.walk")
-	})
 }

@@ -1,6 +1,6 @@
 /*
  * umoci: Umoci Modifies Open Containers' Images
- * Copyright (C) 2016, 2017, 2018 SUSE LLC.
+ * Copyright (C) 2016, 2017 SUSE LLC.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,9 +19,9 @@ package fseval
 
 import (
 	"os"
-	"path/filepath"
 	"time"
 
+	"github.com/openSUSE/umoci/pkg/system"
 	"github.com/vbatts/go-mtree"
 	"golang.org/x/sys/unix"
 )
@@ -76,8 +76,8 @@ type FsEval interface {
 	// MkdirAll is equivalent to os.MkdirAll.
 	MkdirAll(path string, perm os.FileMode) error
 
-	// Mknod is equivalent to unix.Mknod.
-	Mknod(path string, mode os.FileMode, dev uint64) error
+	// Mknod is equivalent to system.Mknod.
+	Mknod(path string, mode os.FileMode, dev system.Dev_t) error
 
 	// Llistxattr is equivalent to system.Llistxattr
 	Llistxattr(path string) ([]string, error)
@@ -92,11 +92,8 @@ type FsEval interface {
 	Lgetxattr(path string, name string) ([]byte, error)
 
 	// Lclearxattrs is equivalent to system.Lclearxattrs
-	Lclearxattrs(path string, except map[string]struct{}) error
+	Lclearxattrs(path string) error
 
 	// KeywordFunc returns a wrapper around the given mtree.KeywordFunc.
 	KeywordFunc(fn mtree.KeywordFunc) mtree.KeywordFunc
-
-	// Walk is equivalent to filepath.Walk.
-	Walk(root string, fn filepath.WalkFunc) error
 }

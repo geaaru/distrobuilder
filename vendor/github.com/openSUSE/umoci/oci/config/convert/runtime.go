@@ -1,6 +1,6 @@
 /*
  * umoci: Umoci Modifies Open Containers' Images
- * Copyright (C) 2016, 2017, 2018 SUSE LLC.
+ * Copyright (C) 2016, 2017 SUSE LLC.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,7 +19,6 @@ package convert
 
 import (
 	"path/filepath"
-	"runtime"
 	"strings"
 
 	"github.com/apex/log"
@@ -46,10 +45,7 @@ const (
 // configuration specified by the OCI runtime-tools. It is equivalent to
 // MutateRuntimeSpec("runtime-tools/generate".New(), image).Spec().
 func ToRuntimeSpec(rootfs string, image ispec.Image) (rspec.Spec, error) {
-	g, err := rgen.New(runtime.GOOS)
-	if err != nil {
-		return rspec.Spec{}, err
-	}
+	g := rgen.New()
 	if err := MutateRuntimeSpec(g, rootfs, image); err != nil {
 		return rspec.Spec{}, err
 	}
@@ -161,12 +157,7 @@ func MutateRuntimeSpec(g rgen.Generator, rootfs string, image ispec.Image) error
 
 	for vol := range ig.ConfigVolumes() {
 		// XXX: This is _fine_ but might cause some issues in the future.
-		g.AddMount(rspec.Mount{
-			Destination: vol,
-			Type:        "tmpfs",
-			Source:      "none",
-			Options:     []string{"rw", "nosuid", "nodev", "noexec", "relatime"},
-		})
+		g.AddTmpfsMount(vol, []string{"rw"})
 	}
 
 	// Remove all seccomp rules.
