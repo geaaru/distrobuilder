@@ -9,9 +9,11 @@ import (
 	"sync"
 
 	"github.com/gorilla/mux"
+
 	lxd "github.com/lxc/lxd/client"
 	"github.com/lxc/lxd/lxd/cluster"
 	"github.com/lxc/lxd/lxd/db"
+	driver "github.com/lxc/lxd/lxd/storage"
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
@@ -21,18 +23,20 @@ import (
 // Lock to prevent concurent storage pools creation
 var storagePoolCreateLock sync.Mutex
 
-var storagePoolsCmd = Command{
-	name: "storage-pools",
-	get:  storagePoolsGet,
-	post: storagePoolsPost,
+var storagePoolsCmd = APIEndpoint{
+	Name: "storage-pools",
+
+	Get:  APIEndpointAction{Handler: storagePoolsGet, AccessHandler: AllowAuthenticated},
+	Post: APIEndpointAction{Handler: storagePoolsPost},
 }
 
-var storagePoolCmd = Command{
-	name:   "storage-pools/{name}",
-	get:    storagePoolGet,
-	put:    storagePoolPut,
-	patch:  storagePoolPatch,
-	delete: storagePoolDelete,
+var storagePoolCmd = APIEndpoint{
+	Name: "storage-pools/{name}",
+
+	Delete: APIEndpointAction{Handler: storagePoolDelete},
+	Get:    APIEndpointAction{Handler: storagePoolGet, AccessHandler: AllowAuthenticated},
+	Patch:  APIEndpointAction{Handler: storagePoolPatch},
+	Put:    APIEndpointAction{Handler: storagePoolPut},
 }
 
 // /1.0/storage-pools
@@ -547,7 +551,7 @@ func storagePoolDelete(d *Daemon, r *http.Request) Response {
 	// notified us. We just need to delete the local mountpoint.
 	if s, ok := s.(*storageCeph); ok && isClusterNotification(r) {
 		// Delete the mountpoint for the storage pool.
-		poolMntPoint := getStoragePoolMountPoint(s.pool.Name)
+		poolMntPoint := driver.GetStoragePoolMountPoint(s.pool.Name)
 		if shared.PathExists(poolMntPoint) {
 			err := os.RemoveAll(poolMntPoint)
 			if err != nil {

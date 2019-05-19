@@ -13,23 +13,26 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
+
+	"github.com/lxc/lxd/lxd/cluster"
 	"github.com/lxc/lxd/lxd/db"
+	"github.com/lxc/lxd/lxd/device"
+	"github.com/lxc/lxd/lxd/dnsmasq"
+	"github.com/lxc/lxd/lxd/project"
 	"github.com/lxc/lxd/lxd/state"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/logger"
-	"github.com/lxc/lxd/shared/version"
 )
 
-var networkStaticLock sync.Mutex
+var forkdnsServersLock sync.Mutex
 
 func networkAutoAttach(cluster *db.Cluster, devName string) error {
 	_, dbInfo, err := cluster.NetworkGetInterface(devName)
@@ -38,26 +41,7 @@ func networkAutoAttach(cluster *db.Cluster, devName string) error {
 		return nil
 	}
 
-	return networkAttachInterface(dbInfo.Name, devName)
-}
-
-func networkAttachInterface(netName string, devName string) error {
-	if shared.PathExists(fmt.Sprintf("/sys/class/net/%s/bridge", netName)) {
-		_, err := shared.RunCommand("ip", "link", "set", "dev", devName, "master", netName)
-		if err != nil {
-			return err
-		}
-	} else {
-		_, err := shared.RunCommand("ovs-vsctl", "port-to-br", devName)
-		if err != nil {
-			_, err := shared.RunCommand("ovs-vsctl", "add-port", netName, devName)
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	return nil
+	return device.NetworkAttachInterface(dbInfo.Name, devName)
 }
 
 func networkDetachInterface(netName string, devName string) error {
@@ -111,7 +95,7 @@ func networkIsInUse(c container, name string) bool {
 			continue
 		}
 
-		if !shared.StringInSlice(d["nictype"], []string{"bridged", "macvlan", "physical", "sriov"}) {
+		if !shared.StringInSlice(d["nictype"], []string{"bridged", "macvlan", "ipvlan", "physical", "sriov"}) {
 			continue
 		}
 
@@ -119,52 +103,12 @@ func networkIsInUse(c container, name string) bool {
 			continue
 		}
 
-		if networkGetHostDevice(d["parent"], d["vlan"]) == name {
+		if device.NetworkGetHostDevice(d["parent"], d["vlan"]) == name {
 			return true
 		}
 	}
 
 	return false
-}
-
-func networkGetHostDevice(parent string, vlan string) string {
-	// If no VLAN, just use the raw device
-	if vlan == "" {
-		return parent
-	}
-
-	// If no VLANs are configured, use the default pattern
-	defaultVlan := fmt.Sprintf("%s.%s", parent, vlan)
-	if !shared.PathExists("/proc/net/vlan/config") {
-		return defaultVlan
-	}
-
-	// Look for an existing VLAN
-	f, err := os.Open("/proc/net/vlan/config")
-	if err != nil {
-		return defaultVlan
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		// Only grab the lines we're interested in
-		s := strings.Split(scanner.Text(), "|")
-		if len(s) != 3 {
-			continue
-		}
-
-		vlanIface := strings.TrimSpace(s[0])
-		vlanId := strings.TrimSpace(s[1])
-		vlanParent := strings.TrimSpace(s[2])
-
-		if vlanParent == parent && vlanId == vlan {
-			return vlanIface
-		}
-	}
-
-	// Return the default pattern
-	return defaultVlan
 }
 
 func networkGetIP(subnet *net.IPNet, host int64) net.IP {
@@ -552,66 +496,6 @@ func networkValidAddressCIDRV4(value string) error {
 	return nil
 }
 
-func networkValidAddress(value string) error {
-	if value == "" {
-		return nil
-	}
-
-	ip := net.ParseIP(value)
-	if ip == nil {
-		return fmt.Errorf("Not an IP address: %s", value)
-	}
-
-	return nil
-}
-
-func networkValidAddressV4(value string) error {
-	if value == "" {
-		return nil
-	}
-
-	ip := net.ParseIP(value)
-	if ip == nil || ip.To4() == nil {
-		return fmt.Errorf("Not an IPv4 address: %s", value)
-	}
-
-	return nil
-}
-
-func networkValidAddressV6(value string) error {
-	if value == "" {
-		return nil
-	}
-
-	ip := net.ParseIP(value)
-	if ip == nil || ip.To4() != nil {
-		return fmt.Errorf("Not an IPv6 address: %s", value)
-	}
-
-	return nil
-}
-
-func networkValidNetworkV4(value string) error {
-	if value == "" {
-		return nil
-	}
-
-	ip, subnet, err := net.ParseCIDR(value)
-	if err != nil {
-		return err
-	}
-
-	if ip.To4() == nil {
-		return fmt.Errorf("Not an IPv4 network: %s", value)
-	}
-
-	if ip.String() != subnet.IP.String() {
-		return fmt.Errorf("Not an IPv4 network address: %s", value)
-	}
-
-	return nil
-}
-
 func networkAddressForSubnet(subnet *net.IPNet) (net.IP, string, error) {
 	ifaces, err := net.Interfaces()
 	if err != nil {
@@ -726,7 +610,7 @@ func networkKillForkDNS(name string) error {
 	}
 
 	// Actually kill the process
-	err = syscall.Kill(pidInt, syscall.SIGKILL)
+	err = unix.Kill(pidInt, unix.SIGKILL)
 	if err != nil {
 		return err
 	}
@@ -734,106 +618,12 @@ func networkKillForkDNS(name string) error {
 	// Cleanup
 	os.Remove(pidPath)
 	return nil
-}
-
-func networkKillDnsmasq(name string, reload bool) error {
-	// Check if we have a running dnsmasq at all
-	pidPath := shared.VarPath("networks", name, "dnsmasq.pid")
-	if !shared.PathExists(pidPath) {
-		if reload {
-			return fmt.Errorf("dnsmasq isn't running")
-		}
-
-		return nil
-	}
-
-	// Grab the PID
-	content, err := ioutil.ReadFile(pidPath)
-	if err != nil {
-		return err
-	}
-	pid := strings.TrimSpace(string(content))
-
-	// Check for empty string
-	if pid == "" {
-		os.Remove(pidPath)
-
-		if reload {
-			return fmt.Errorf("dnsmasq isn't running")
-		}
-
-		return nil
-	}
-
-	// Check if the process still exists
-	if !shared.PathExists(fmt.Sprintf("/proc/%s", pid)) {
-		os.Remove(pidPath)
-
-		if reload {
-			return fmt.Errorf("dnsmasq isn't running")
-		}
-
-		return nil
-	}
-
-	// Check if it's dnsmasq
-	cmdPath, err := os.Readlink(fmt.Sprintf("/proc/%s/exe", pid))
-	if err != nil {
-		cmdPath = ""
-	}
-
-	// Deal with deleted paths
-	cmdName := filepath.Base(strings.Split(cmdPath, " ")[0])
-	if cmdName != "dnsmasq" {
-		if reload {
-			return fmt.Errorf("dnsmasq isn't running")
-		}
-
-		os.Remove(pidPath)
-		return nil
-	}
-
-	// Parse the pid
-	pidInt, err := strconv.Atoi(pid)
-	if err != nil {
-		return err
-	}
-
-	// Actually kill the process
-	if reload {
-		err = syscall.Kill(pidInt, syscall.SIGHUP)
-		if err != nil {
-			return err
-		}
-
-		return nil
-	}
-
-	err = syscall.Kill(pidInt, syscall.SIGKILL)
-	if err != nil {
-		return err
-	}
-
-	// Cleanup
-	os.Remove(pidPath)
-	return nil
-}
-
-func networkGetDnsmasqVersion() (*version.DottedVersion, error) {
-	// Discard stderr on purpose (occasional linker errors)
-	output, err := exec.Command("dnsmasq", "--version").Output()
-	if err != nil {
-		return nil, fmt.Errorf("Failed to check dnsmasq version: %v", err)
-	}
-
-	lines := strings.Split(string(output), " ")
-	return version.NewDottedVersion(lines[2])
 }
 
 func networkUpdateStatic(s *state.State, networkName string) error {
 	// We don't want to race with ourselves here
-	networkStaticLock.Lock()
-	defer networkStaticLock.Unlock()
+	dnsmasq.ConfigMutex.Lock()
+	defer dnsmasq.ConfigMutex.Unlock()
 
 	// Get all the networks
 	var networks []string
@@ -875,7 +665,22 @@ func networkUpdateStatic(s *state.State, networkName string) error {
 				entries[d["parent"]] = [][]string{}
 			}
 
-			entries[d["parent"]] = append(entries[d["parent"]], []string{d["hwaddr"], projectPrefix(c.Project(), c.Name()), d["ipv4.address"], d["ipv6.address"]})
+			if (shared.IsTrue(d["security.ipv4_filtering"]) && d["ipv4.address"] == "") || (shared.IsTrue(d["security.ipv6_filtering"]) && d["ipv6.address"] == "") {
+				curIPv4, curIPv6, err := dnsmasq.DHCPStaticIPs(d["parent"], c.Name())
+				if err != nil && !os.IsNotExist(err) {
+					return err
+				}
+
+				if d["ipv4.address"] == "" && curIPv4.IP != nil {
+					d["ipv4.address"] = curIPv4.IP.String()
+				}
+
+				if d["ipv6.address"] == "" && curIPv6.IP != nil {
+					d["ipv6.address"] = curIPv6.IP.String()
+				}
+			}
+
+			entries[d["parent"]] = append(entries[d["parent"]], []string{d["hwaddr"], c.Project(), c.Name(), d["ipv4.address"], d["ipv6.address"]})
 		}
 	}
 
@@ -910,36 +715,37 @@ func networkUpdateStatic(s *state.State, networkName string) error {
 		// Apply the changes
 		for entryIdx, entry := range entries {
 			hwaddr := entry[0]
-			cName := entry[1]
-			ipv4Address := entry[2]
-			ipv6Address := entry[3]
+			projectName := entry[1]
+			cName := entry[2]
+			ipv4Address := entry[3]
+			ipv6Address := entry[4]
 			line := hwaddr
 
 			// Look for duplicates
 			duplicate := false
 			for iIdx, i := range entries {
-				if entry[1] == i[1] {
+				if project.Prefix(entry[1], entry[2]) == project.Prefix(i[1], i[2]) {
 					// Skip ourselves
 					continue
 				}
 
 				if entry[0] == i[0] {
 					// Find broken configurations
-					logger.Errorf("Duplicate MAC detected: %s and %s", entry[1], i[1])
+					logger.Errorf("Duplicate MAC detected: %s and %s", project.Prefix(entry[1], entry[2]), project.Prefix(i[1], i[2]))
 				}
 
-				if i[2] == "" && i[3] == "" {
+				if i[3] == "" && i[4] == "" {
 					// Skip unconfigured
 					continue
 				}
 
-				if entry[2] == i[2] && entry[3] == i[3] {
+				if entry[3] == i[3] && entry[4] == i[4] {
 					// Find identical containers (copies with static configuration)
 					if entryIdx > iIdx {
 						duplicate = true
 					} else {
 						line = fmt.Sprintf("%s,%s", line, i[0])
-						logger.Debugf("Found containers with duplicate IPv4/IPv6: %s and %s", entry[1], i[1])
+						logger.Debugf("Found containers with duplicate IPv4/IPv6: %s and %s", project.Prefix(entry[1], entry[2]), project.Prefix(i[1], i[2]))
 					}
 				}
 			}
@@ -949,30 +755,14 @@ func networkUpdateStatic(s *state.State, networkName string) error {
 			}
 
 			// Generate the dhcp-host line
-			if ipv4Address != "" {
-				line += fmt.Sprintf(",%s", ipv4Address)
-			}
-
-			if ipv6Address != "" {
-				line += fmt.Sprintf(",[%s]", ipv6Address)
-			}
-
-			if config["dns.mode"] == "" || config["dns.mode"] == "managed" {
-				line += fmt.Sprintf(",%s", cName)
-			}
-
-			if line == hwaddr {
-				continue
-			}
-
-			err := ioutil.WriteFile(shared.VarPath("networks", network, "dnsmasq.hosts", cName), []byte(line+"\n"), 0644)
+			err := dnsmasq.UpdateStaticEntry(network, projectName, cName, config, hwaddr, ipv4Address, ipv6Address)
 			if err != nil {
 				return err
 			}
 		}
 
 		// Signal dnsmasq
-		err = networkKillDnsmasq(network, true)
+		err = dnsmasq.Kill(network, true)
 		if err != nil {
 			return err
 		}
@@ -981,25 +771,87 @@ func networkUpdateStatic(s *state.State, networkName string) error {
 	return nil
 }
 
-func networkSysctlGet(path string) (string, error) {
-	// Read the current content
-	content, err := ioutil.ReadFile(fmt.Sprintf("/proc/sys/net/%s", path))
+// networkUpdateForkdnsServersFile takes a list of node addresses and writes them atomically to
+// the forkdns.servers file ready for forkdns to notice and re-apply its config.
+func networkUpdateForkdnsServersFile(networkName string, addresses []string) error {
+	// We don't want to race with ourselves here
+	forkdnsServersLock.Lock()
+	defer forkdnsServersLock.Unlock()
+
+	permName := shared.VarPath("networks", networkName, forkdnsServersListPath+"/"+forkdnsServersListFile)
+	tmpName := permName + ".tmp"
+
+	// Open tmp file and truncate
+	tmpFile, err := os.Create(tmpName)
 	if err != nil {
-		return "", err
+		return err
+	}
+	defer tmpFile.Close()
+
+	for _, address := range addresses {
+		_, err := tmpFile.WriteString(address + "\n")
+		if err != nil {
+			return err
+		}
 	}
 
-	return string(content), nil
+	tmpFile.Close()
+
+	// Atomically rename finished file into permanent location so forkdns can pick it up.
+	err = os.Rename(tmpName, permName)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
-func networkSysctlSet(path string, value string) error {
-	// Get current value
-	current, err := networkSysctlGet(path)
-	if err == nil && current == value {
-		// Nothing to update
-		return nil
+// networkUpdateForkdnsServersTask runs every 30s and refreshes the forkdns servers list.
+func networkUpdateForkdnsServersTask(s *state.State, heartbeatData *cluster.APIHeartbeat) error {
+	// Get a list of managed networks
+	networks, err := s.Cluster.NetworksNotPending()
+	if err != nil {
+		return err
 	}
 
-	return ioutil.WriteFile(fmt.Sprintf("/proc/sys/net/%s", path), []byte(value), 0)
+	for _, name := range networks {
+		n, err := networkLoadByName(s, name)
+		if err != nil {
+			return err
+		}
+
+		if n.config["bridge.mode"] == "fan" {
+			err := n.refreshForkdnsServerAddresses(heartbeatData)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// networksGetForkdnsServersList reads the server list file and returns the list as a slice.
+func networksGetForkdnsServersList(networkName string) ([]string, error) {
+	servers := []string{}
+	file, err := os.Open(shared.VarPath("networks", networkName, forkdnsServersListPath, "/", forkdnsServersListFile))
+	if err != nil {
+		return servers, err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) > 0 {
+			servers = append(servers, fields[0])
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return servers, err
+	}
+
+	return servers, nil
 }
 
 func networkGetMacSlice(hwaddr string) []string {
@@ -1022,74 +874,6 @@ func networkGetMacSlice(hwaddr string) []string {
 	}
 
 	return buf
-}
-
-func networkClearLease(s *state.State, name string, network string, hwaddr string) error {
-	leaseFile := shared.VarPath("networks", network, "dnsmasq.leases")
-
-	// Check that we are in fact running a dnsmasq for the network
-	if !shared.PathExists(leaseFile) {
-		return nil
-	}
-
-	// Restart the network when we're done here
-	n, err := networkLoadByName(s, network)
-	if err != nil {
-		return err
-	}
-	defer n.Start()
-
-	// Stop dnsmasq
-	err = networkKillDnsmasq(network, false)
-	if err != nil {
-		return err
-	}
-
-	// Mangle the lease file
-	leases, err := ioutil.ReadFile(leaseFile)
-	if err != nil {
-		return err
-	}
-
-	fd, err := os.Create(leaseFile)
-	if err != nil {
-		return err
-	}
-
-	knownMac := networkGetMacSlice(hwaddr)
-	for _, lease := range strings.Split(string(leases), "\n") {
-		if lease == "" {
-			continue
-		}
-
-		fields := strings.Fields(lease)
-		if len(fields) > 2 {
-			if strings.Contains(fields[1], ":") {
-				leaseMac := networkGetMacSlice(fields[1])
-				leaseMacStr := strings.Join(leaseMac, ":")
-
-				knownMacStr := strings.Join(knownMac[len(knownMac)-len(leaseMac):], ":")
-				if knownMacStr == leaseMacStr {
-					continue
-				}
-			} else if len(fields) > 3 && fields[3] == name {
-				// Mostly IPv6 leases which don't contain a MAC address...
-				continue
-			}
-		}
-
-		_, err := fd.WriteString(fmt.Sprintf("%s\n", lease))
-		if err != nil {
-			return err
-		}
-	}
-
-	err = fd.Close()
-	if err != nil {
-		return err
-	}
-
-	return nil
 }
 
 func networkGetState(netIf net.Interface) api.NetworkState {
@@ -1165,4 +949,68 @@ func networkGetState(netIf net.Interface) api.NetworkState {
 	// Get counters
 	network.Counters = shared.NetworkGetCounters(netIf.Name)
 	return network
+}
+
+// networkListBootRoutesV4 returns a list of IPv4 boot routes on a named network device.
+func networkListBootRoutesV4(devName string) ([]string, error) {
+	routes := []string{}
+	cmd := exec.Command("ip", "-4", "route", "show", "dev", devName, "proto", "boot")
+	ipOut, err := cmd.StdoutPipe()
+	if err != nil {
+		return routes, err
+	}
+	cmd.Start()
+	scanner := bufio.NewScanner(ipOut)
+	for scanner.Scan() {
+		route := strings.Replace(scanner.Text(), "linkdown", "", -1)
+		routes = append(routes, route)
+	}
+	cmd.Wait()
+	return routes, nil
+}
+
+// networkListBootRoutesV6 returns a list of IPv6 boot routes on a named network device.
+func networkListBootRoutesV6(devName string) ([]string, error) {
+	routes := []string{}
+	cmd := exec.Command("ip", "-6", "route", "show", "dev", devName, "proto", "boot")
+	ipOut, err := cmd.StdoutPipe()
+	if err != nil {
+		return routes, err
+	}
+	cmd.Start()
+	scanner := bufio.NewScanner(ipOut)
+	for scanner.Scan() {
+		route := strings.Replace(scanner.Text(), "linkdown", "", -1)
+		routes = append(routes, route)
+	}
+	cmd.Wait()
+	return routes, nil
+}
+
+// networkApplyBootRoutesV4 applies a list of IPv4 boot routes to a named network device.
+func networkApplyBootRoutesV4(devName string, routes []string) error {
+	for _, route := range routes {
+		cmd := []string{"-4", "route", "replace", "dev", devName, "proto", "boot"}
+		cmd = append(cmd, strings.Fields(route)...)
+		_, err := shared.RunCommand("ip", cmd...)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// networkApplyBootRoutesV6 applies a list of IPv6 boot routes to a named network device.
+func networkApplyBootRoutesV6(devName string, routes []string) error {
+	for _, route := range routes {
+		cmd := []string{"-6", "route", "replace", "dev", devName, "proto", "boot"}
+		cmd = append(cmd, strings.Fields(route)...)
+		_, err := shared.RunCommand("ip", cmd...)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }

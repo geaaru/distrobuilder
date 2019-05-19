@@ -77,6 +77,8 @@ security.protection.shift               | boolean   | false             | yes   
 security.syscalls.blacklist             | string    | -                 | no            | container\_syscall\_filtering        | A '\n' separated list of syscalls to blacklist
 security.syscalls.blacklist\_compat     | boolean   | false             | no            | container\_syscall\_filtering        | On x86\_64 this enables blocking of compat\_\* syscalls, it is a no-op on other arches
 security.syscalls.blacklist\_default    | boolean   | true              | no            | container\_syscall\_filtering        | Enables the default syscall blacklist
+security.syscalls.intercept.mknod       | boolean   | false             | no            | container\_syscall\_intercept        | Handles the `mknod` and `mknodat` system calls (allows creation of a limited subset of char/block devices)
+security.syscalls.intercept.setxattr    | boolean   | false             | no            | container\_syscall\_intercept        | Handles the `setxattr` system call (allows setting a limited subset of restricted extended attributes)
 security.syscalls.whitelist             | string    | -                 | no            | container\_syscall\_filtering        | A '\n' separated list of syscalls to whitelist (mutually exclusive with security.syscalls.blacklist\*)
 snapshots.schedule                      | string    | -                 | no            | snapshot\_scheduling                 | Cron expression (`<minute> <hour> <dom> <month> <dow>`)
 snapshots.schedule.stopped              | bool      | false             | no            | snapshot\_scheduling                 | Controls whether or not stopped containers are to be snapshoted automatically
@@ -86,20 +88,25 @@ user.\*                                 | string    | -                 | n/a   
 
 The following volatile keys are currently internally used by LXD:
 
-Key                             | Type      | Default       | Description
-:--                             | :---      | :------       | :----------
-volatile.apply\_quota           | string    | -             | Disk quota to be applied on next container start
-volatile.apply\_template        | string    | -             | The name of a template hook which should be triggered upon next startup
-volatile.base\_image            | string    | -             | The hash of the image the container was created from, if any.
-volatile.idmap.base             | integer   | -             | The first id in the container's primary idmap range
-volatile.idmap.current          | string    | -             | The idmap currently in use by the container
-volatile.idmap.next             | string    | -             | The idmap to use next time the container starts
-volatile.last\_state.idmap      | string    | -             | Serialized container uid/gid map
-volatile.last\_state.power      | string    | -             | Container state as of last host shutdown
-volatile.\<name\>.host\_name    | string    | -             | Network device name on the host (for nictype=bridged or nictype=p2p, or nictype=sriov)
-volatile.\<name\>.hwaddr        | string    | -             | Network device MAC address (when no hwaddr property is set on the device itself)
-volatile.\<name\>.name          | string    | -             | Network device name (when no name propery is set on the device itself)
-
+Key                                         | Type      | Default       | Description
+:--                                         | :---      | :------       | :----------
+volatile.apply\_quota                       | string    | -             | Disk quota to be applied on next container start
+volatile.apply\_template                    | string    | -             | The name of a template hook which should be triggered upon next startup
+volatile.base\_image                        | string    | -             | The hash of the image the container was created from, if any.
+volatile.idmap.base                         | integer   | -             | The first id in the container's primary idmap range
+volatile.idmap.current                      | string    | -             | The idmap currently in use by the container
+volatile.idmap.next                         | string    | -             | The idmap to use next time the container starts
+volatile.last\_state.idmap                  | string    | -             | Serialized container uid/gid map
+volatile.last\_state.power                  | string    | -             | Container state as of last host shutdown
+volatile.\<name\>.host\_name                | string    | -             | Network device name on the host
+volatile.\<name\>.hwaddr                    | string    | -             | Network device MAC address (when no hwaddr property is set on the device itself)
+volatile.\<name\>.last\_state.created       | string    | -             | Whether or not the network device physical device was created ("true" or "false")
+volatile.\<name\>.last\_state.mtu           | string    | -             | Network device original MTU used when moving a physical device into a container
+volatile.\<name\>.last\_state.hwaddr        | string    | -             | Network device original MAC used when moving a physical device into a container
+volatile.\<name\>.last\_state.vf.id         | string    | -             | SR-IOV Virtual function ID used when moving a VF into a container
+volatile.\<name\>.last\_state.vf.hwaddr     | string    | -             | SR-IOV Virtual function original MAC used when moving a VF into a container
+volatile.\<name\>.last\_state.vf.vlan       | string    | -             | SR-IOV Virtual function original VLAN used when moving a VF into a container
+volatile.\<name\>.last\_state.vf.spoofcheck | string    | -             | SR-IOV Virtual function original spoof check setting used when moving a VF into a container
 
 Additionally, those user keys have become common with images (support isn't guaranteed):
 
@@ -228,37 +235,152 @@ It can be added in a profile being applied after the profile it originated from 
 ### Type: nic
 LXD supports different kind of network devices:
 
- - `physical`: Straight physical device passthrough from the host. The targeted device will vanish from the host and appear in the container.
- - `bridged`: Uses an existing bridge on the host and creates a virtual device pair to connect the host bridge to the container.
- - `macvlan`: Sets up a new network device based on an existing one but using a different MAC address.
- - `p2p`: Creates a virtual device pair, putting one side in the container and leaving the other side on the host.
- - `sriov`: Passes a virtual function of an SR-IOV enabled physical network device into the container.
+ - [physical](#nictype-physical): Straight physical device passthrough from the host. The targeted device will vanish from the host and appear in the container.
+ - [bridged](#nictype-bridged): Uses an existing bridge on the host and creates a virtual device pair to connect the host bridge to the container.
+ - [macvlan](#nictype-macvlan): Sets up a new network device based on an existing one but using a different MAC address.
+ - [ipvlan](#nictype-ipvlan): Sets up a new network device based on an existing one using the same MAC address but a different IP.
+ - [p2p](#nictype-p2p): Creates a virtual device pair, putting one side in the container and leaving the other side on the host.
+ - [sriov](#nictype-sriov): Passes a virtual function of an SR-IOV enabled physical network device into the container.
 
-Different network interface types have different additional properties, the current list is:
+Different network interface types have different additional properties.
 
-Key                     | Type      | Default           | Required  | Used by                           | API extension                          | Description
-:--                     | :--       | :--               | :--       | :--                               | :--                                    | :--
-nictype                 | string    | -                 | yes       | all                               | -                                      | The device type, one of "bridged", "macvlan", "p2p", "physical", or "sriov"
-limits.ingress          | string    | -                 | no        | bridged, p2p                      | -                                      | I/O limit in bit/s for incoming traffic (various suffixes supported, see below)
-limits.egress           | string    | -                 | no        | bridged, p2p                      | -                                      | I/O limit in bit/s for outgoing traffic (various suffixes supported, see below)
-limits.max              | string    | -                 | no        | bridged, p2p                      | -                                      | Same as modifying both limits.ingress and limits.egress
-name                    | string    | kernel assigned   | no        | all                               | -                                      | The name of the interface inside the container
-host\_name              | string    | randomly assigned | no        | bridged, macvlan, p2p, sriov      | -                                      | The name of the interface inside the host
-hwaddr                  | string    | randomly assigned | no        | all                               | -                                      | The MAC address of the new interface
-mtu                     | integer   | parent MTU        | no        | all                               | -                                      | The MTU of the new interface
-parent                  | string    | -                 | yes       | bridged, macvlan, physical, sriov | -                                      | The name of the host device or bridge
-vlan                    | integer   | -                 | no        | macvlan, physical                 | network\_vlan, network\_vlan\_physical | The VLAN ID to attach to
-ipv4.address            | string    | -                 | no        | bridged                           | network                                | An IPv4 address to assign to the container through DHCP
-ipv6.address            | string    | -                 | no        | bridged                           | network                                | An IPv6 address to assign to the container through DHCP
-security.mac\_filtering | boolean   | false             | no        | bridged                           | network                                | Prevent the container from spoofing another's MAC address
-maas.subnet.ipv4        | string    | -                 | no        | bridged, macvlan, physical, sriov | maas\_network                          | MAAS IPv4 subnet to register the container in
-maas.subnet.ipv6        | string    | -                 | no        | bridged, macvlan, physical, sriov | maas\_network                          | MAAS IPv6 subnet to register the container in
+Each possible `nictype` value is documented below along with the relevant properties for nics of that type.
 
-#### bridged or macvlan for connection to physical network
-The `bridged` and `macvlan` interface types can both be used to connect
+#### nictype: physical
+
+Straight physical device passthrough from the host. The targeted device will vanish from the host and appear in the container.
+
+Device configuration properties:
+
+Key                     | Type      | Default           | Required  | API extension                          | Description
+:--                     | :--       | :--               | :--       | :--                                    | :--
+parent                  | string    | -                 | yes       | -                                      | The name of the host device
+name                    | string    | kernel assigned   | no        | -                                      | The name of the interface inside the container
+mtu                     | integer   | parent MTU        | no        | -                                      | The MTU of the new interface
+hwaddr                  | string    | randomly assigned | no        | -                                      | The MAC address of the new interface
+vlan                    | integer   | -                 | no        | network\_vlan\_physical                | The VLAN ID to attach to
+maas.subnet.ipv4        | string    | -                 | no        | maas\_network                          | MAAS IPv4 subnet to register the container in
+maas.subnet.ipv6        | string    | -                 | no        | maas\_network                          | MAAS IPv6 subnet to register the container in
+
+#### nictype: bridged
+
+Uses an existing bridge on the host and creates a virtual device pair to connect the host bridge to the container.
+
+Device configuration properties:
+
+Key                      | Type      | Default           | Required  | API extension                          | Description
+:--                      | :--       | :--               | :--       | :--                                    | :--
+parent                   | string    | -                 | yes       | -                                      | The name of the host device
+name                     | string    | kernel assigned   | no        | -                                      | The name of the interface inside the container
+mtu                      | integer   | parent MTU        | no        | -                                      | The MTU of the new interface
+hwaddr                   | string    | randomly assigned | no        | -                                      | The MAC address of the new interface
+host\_name               | string    | randomly assigned | no        | -                                      | The name of the interface inside the host
+limits.ingress           | string    | -                 | no        | -                                      | I/O limit in bit/s for incoming traffic (various suffixes supported, see below)
+limits.egress            | string    | -                 | no        | -                                      | I/O limit in bit/s for outgoing traffic (various suffixes supported, see below)
+limits.max               | string    | -                 | no        | -                                      | Same as modifying both limits.ingress and limits.egress
+ipv4.address             | string    | -                 | no        | network                                | An IPv4 address to assign to the container through DHCP
+ipv6.address             | string    | -                 | no        | network                                | An IPv6 address to assign to the container through DHCP
+ipv4.routes              | string    | -                 | no        | container\_nic\_routes                 | Comma delimited list of IPv4 static routes to add on host to nic
+ipv6.routes              | string    | -                 | no        | container\_nic\_routes                 | Comma delimited list of IPv6 static routes to add on host to nic
+security.mac\_filtering  | boolean   | false             | no        | network                                | Prevent the container from spoofing another's MAC address
+security.ipv4\_filtering | boolean   | false             | no        | container\_nic\_ipfilter               | Prevent the container from spoofing another's IPv4 address (enables mac\_filtering)
+security.ipv6\_filtering | boolean   | false             | no        | container\_nic\_ipfilter               | Prevent the container from spoofing another's IPv6 address (enables mac\_filtering)
+maas.subnet.ipv4         | string    | -                 | no        | maas\_network                          | MAAS IPv4 subnet to register the container in
+maas.subnet.ipv6         | string    | -                 | no        | maas\_network                          | MAAS IPv6 subnet to register the container in
+
+#### nictype: macvlan
+
+Sets up a new network device based on an existing one but using a different MAC address.
+
+Device configuration properties:
+
+Key                     | Type      | Default           | Required  | API extension                          | Description
+:--                     | :--       | :--               | :--       | :--                                    | :--
+parent                  | string    | -                 | yes       | -                                      | The name of the host device
+name                    | string    | kernel assigned   | no        | -                                      | The name of the interface inside the container
+mtu                     | integer   | parent MTU        | no        | -                                      | The MTU of the new interface
+hwaddr                  | string    | randomly assigned | no        | -                                      | The MAC address of the new interface
+vlan                    | integer   | -                 | no        | network\_vlan                          | The VLAN ID to attach to
+maas.subnet.ipv4        | string    | -                 | no        | maas\_network                          | MAAS IPv4 subnet to register the container in
+maas.subnet.ipv6        | string    | -                 | no        | maas\_network                          | MAAS IPv6 subnet to register the container in
+
+#### nictype: ipvlan
+
+Sets up a new network device based on an existing one using the same MAC address but a different IP.
+
+LXD currently supports IPVLAN in L3S mode.
+
+In this mode, the gateway is automatically set by LXD, however IP addresses must be manually specified using either one or both of `ipv4.address` and `ipv6.address` settings before container is started.
+
+For DNS, the nameservers need to be configured inside the container, as these will not automatically be set.
+
+It requires the following sysctls to be set:
+
+If using IPv4 addresses:
+
+```
+net.ipv4.conf.<parent>.forwarding=1
+```
+
+If using IPv6 addresses:
+
+```
+net.ipv6.conf.<parent>.forwarding=1
+net.ipv6.conf.<parent>.proxy_ndp=1
+```
+
+Device configuration properties:
+
+Key                     | Type      | Default           | Required  | API extension                          | Description
+:--                     | :--       | :--               | :--       | :--                                    | :--
+parent                  | string    | -                 | yes       | -                                      | The name of the host device
+name                    | string    | kernel assigned   | no        | -                                      | The name of the interface inside the container
+mtu                     | integer   | parent MTU        | no        | -                                      | The MTU of the new interface
+hwaddr                  | string    | randomly assigned | no        | -                                      | The MAC address of the new interface
+ipv4.address            | string    | -                 | no        | network                                | Comma delimited list of IPv4 static addresses to add to container
+ipv6.address            | string    | -                 | no        | network                                | Comma delimited list of IPv6 static addresses to add to container
+vlan                    | integer   | -                 | no        | network\_vlan                          | The VLAN ID to attach to
+
+#### nictype: p2p
+
+Creates a virtual device pair, putting one side in the container and leaving the other side on the host.
+
+Device configuration properties:
+
+Key                     | Type      | Default           | Required  | API extension                          | Description
+:--                     | :--       | :--               | :--       | :--                                    | :--
+name                    | string    | kernel assigned   | no        | -                                      | The name of the interface inside the container
+mtu                     | integer   | kernel assigned   | no        | -                                      | The MTU of the new interface
+hwaddr                  | string    | randomly assigned | no        | -                                      | The MAC address of the new interface
+host\_name              | string    | randomly assigned | no        | -                                      | The name of the interface inside the host
+limits.ingress          | string    | -                 | no        | -                                      | I/O limit in bit/s for incoming traffic (various suffixes supported, see below)
+limits.egress           | string    | -                 | no        | -                                      | I/O limit in bit/s for outgoing traffic (various suffixes supported, see below)
+limits.max              | string    | -                 | no        | -                                      | Same as modifying both limits.ingress and limits.egress
+ipv4.routes             | string    | -                 | no        | container\_nic\_routes                 | Comma delimited list of IPv4 static routes to add on host to nic
+ipv6.routes             | string    | -                 | no        | container\_nic\_routes                 | Comma delimited list of IPv6 static routes to add on host to nic
+
+#### nictype: sriov
+
+Passes a virtual function of an SR-IOV enabled physical network device into the container.
+
+Device configuration properties:
+
+Key                     | Type      | Default           | Required  | API extension                          | Description
+:--                     | :--       | :--               | :--       | :--                                    | :--
+parent                  | string    | -                 | yes       | -                                      | The name of the host device
+name                    | string    | kernel assigned   | no        | -                                      | The name of the interface inside the container
+mtu                     | integer   | kernel assigned   | no        | -                                      | The MTU of the new interface
+hwaddr                  | string    | randomly assigned | no        | -                                      | The MAC address of the new interface
+security.mac\_filtering | boolean   | false             | no        | network\_vlan\_sriov                   | Prevent the container from spoofing another's MAC address
+vlan                    | integer   | -                 | no        | network\_vlan\_sriov                   | The VLAN ID to attach to
+maas.subnet.ipv4        | string    | -                 | no        | maas\_network                          | MAAS IPv4 subnet to register the container in
+maas.subnet.ipv6        | string    | -                 | no        | maas\_network                          | MAAS IPv6 subnet to register the container in
+
+#### bridged, macvlan or ipvlan for connection to physical network
+The `bridged`, `macvlan` and `ipvlan` interface types can both be used to connect
 to an existing physical network.
 
-macvlan effectively lets you fork your physical NIC, getting a second
+`macvlan` effectively lets you fork your physical NIC, getting a second
 interface that's then used by the container. This saves you from
 creating a bridge device and veth pairs and usually offers better
 performance than a bridge.
@@ -270,6 +392,9 @@ your containers to talk to the host itself.
 
 In such case, a bridge is preferable. A bridge will also let you use mac
 filtering and I/O limits which cannot be applied to a macvlan device.
+
+`ipvlan` is similar to `macvlan`, with the difference being that the forked device has IPs
+statically assigned to it and inherits the parent's MAC address on the network.
 
 #### SR-IOV
 The `sriov` interface type supports SR-IOV enabled network devices. These
@@ -324,7 +449,7 @@ Key                     | Type      | Default           | Required  | Used by   
 :--                     | :--       | :--               | :--       | :--             | :--           | :--
 nictype                 | string    | -                 | yes       | all             | infiniband    | The device type, one of "physical", or "sriov"
 name                    | string    | kernel assigned   | no        | all             | infiniband    | The name of the interface inside the container
-hwaddr                  | string    | randomly assigned | no        | all             | infiniband    | The MAC address of the new interface
+hwaddr                  | string    | randomly assigned | no        | all             | infiniband    | The MAC address of the new interface. Can be either full 20 byte variant or short 8 byte variant (which will only modify the last 8 bytes of the parent device)
 mtu                     | integer   | parent MTU        | no        | all             | infiniband    | The MTU of the new interface
 parent                  | string    | -                 | yes       | physical, sriov | infiniband    | The name of the host device or bridge
 
@@ -360,12 +485,13 @@ limits.write    | string    | -                 | no        | I/O limit in byte/
 limits.max      | string    | -                 | no        | Same as modifying both limits.read and limits.write
 path            | string    | -                 | yes       | Path inside the container where the disk will be mounted
 source          | string    | -                 | yes       | Path on the host, either to a file/directory or to a block device
-optional        | boolean   | false             | no        | Controls whether to fail if the source doesn't exist
+required        | boolean   | true              | no        | Controls whether to fail if the source doesn't exist
 readonly        | boolean   | false             | no        | Controls whether to make the mount read-only
 size            | string    | -                 | no        | Disk size in bytes (various suffixes supported, see below). This is only supported for the rootfs (/).
 recursive       | boolean   | false             | no        | Whether or not to recursively mount the source path
 pool            | string    | -                 | no        | The storage pool the disk device belongs to. This is only applicable for storage volumes managed by LXD.
 propagation     | string    | -                 | no        | Controls how a bind-mount is shared between the container and the host. (Can be one of `private`, the default, or `shared`, `slave`, `unbindable`,  `rshared`, `rslave`, `runbindable`,  `rprivate`. Please see the Linux Kernel [shared subtree](https://www.kernel.org/doc/Documentation/filesystems/sharedsubtree.txt) documentation for a full explanation)
+shift           | boolean   | false             | no        | Setup a shifting overlay to translate the source uid/gid to match the container
 
 If multiple disks, backed by the same block device, have I/O limits set,
 the average of the limits will be used.
@@ -417,7 +543,7 @@ productid   | string    | -                 | no        | The product id of the 
 uid         | int       | 0                 | no        | UID of the device owner in the container
 gid         | int       | 0                 | no        | GID of the device owner in the container
 mode        | int       | 0660              | no        | Mode of the device in the container
-required    | boolean   | false             | no        | Whether or not this device is required to start the container. (The default is no, and all devices are hot-pluggable.)
+required    | boolean   | false             | no        | Whether or not this device is required to start the container. (The default is false, and all devices are hot-pluggable)
 
 ### Type: gpu
 GPU device entries simply make the requested gpu device appear in the
@@ -456,10 +582,10 @@ Key             | Type      | Default           | Required  | Description
 :--             | :--       | :--               | :--       | :--
 listen          | string    | -                 | yes       | The address and port to bind and listen
 connect         | string    | -                 | yes       | The address and port to connect to
-bind            | string    | host              | no        | Which side to bind on (host/container)
+bind            | string    | host              | no        | Which side to bind on (host/guest)
 uid             | int       | 0                 | no        | UID of the owner of the listening Unix socket
 gid             | int       | 0                 | no        | GID of the owner of the listening Unix socket
-mode            | int       | 0755              | no        | Mode for the listening Unix socket
+mode            | int       | 0644              | no        | Mode for the listening Unix socket
 nat             | bool      | false             | no        | Whether to optimize proxying via NAT
 proxy\_protocol | bool      | false             | no        | Whether to use the HAProxy PROXY protocol to transmit sender information
 security.uid    | int       | 0                 | no        | What UID to drop privilege to
@@ -593,7 +719,7 @@ empty (default), no snapshots will be created. `snapshots.schedule.stopped`
 controls whether or not stopped container are to be automatically snapshotted.
 It defaults to `false`. `snapshots.pattern` takes a pongo2 template string,
 and the pongo2 context contains the `creation_date` variable. Be aware that you
-should format the date (e.g. use `{{ creation_date|date:"2006-01-02_15-04-05" }}`) 
+should format the date (e.g. use `{{ creation_date|date:"2006-01-02_15-04-05" }}`)
 in your template string to avoid forbidden characters in your snapshot name.
 Another way to avoid name collisions is to use the placeholder `%d`. If a snapshot
 with the same name (excluding the placeholder) already exists, all existing snapshot

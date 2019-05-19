@@ -13,13 +13,9 @@ test_migration() {
   # workaround for kernel/criu
   umount /sys/kernel/debug >/dev/null 2>&1 || true
 
-  if ! lxc_remote remote list | grep -q l1; then
-    # shellcheck disable=2153
-    lxc_remote remote add l1 "${LXD_ADDR}" --accept-certificate --password foo
-  fi
-  if ! lxc_remote remote list | grep -q l2; then
-    lxc_remote remote add l2 "${LXD2_ADDR}" --accept-certificate --password foo
-  fi
+  # shellcheck disable=2153
+  lxc_remote remote add l1 "${LXD_ADDR}" --accept-certificate --password foo
+  lxc_remote remote add l2 "${LXD2_ADDR}" --accept-certificate --password foo
 
   migration "$LXD2_DIR"
 
@@ -50,6 +46,7 @@ test_migration() {
     lxc_remote storage delete l2:"$storage_pool2"
   fi
 
+  lxc_remote remote remove l1
   lxc_remote remote remove l2
   kill_lxd "$LXD2_DIR"
 }
@@ -279,34 +276,58 @@ migration() {
   remote_pool2="lxdtest-$(basename "${lxd2_dir}")"
 
   lxc_remote storage volume create l1:"$remote_pool1" vol1
+  lxc_remote storage volume create l1:"$remote_pool1" vol2
+  lxc_remote storage volume snapshot l1:"$remote_pool1" vol2
 
   # remote storage volume migration in "pull" mode
   lxc_remote storage volume copy l1:"$remote_pool1/vol1" l2:"$remote_pool2/vol2"
   lxc_remote storage volume move l1:"$remote_pool1/vol1" l2:"$remote_pool2/vol3"
   ! lxc_remote storage volume list l1:"$remote_pool1/vol1" || false
+  lxc_remote storage volume copy l1:"$remote_pool1/vol2" l2:"$remote_pool2/vol4" --volume-only
+  lxc_remote storage volume copy l1:"$remote_pool1/vol2" l2:"$remote_pool2/vol5"
+  lxc_remote storage volume move l1:"$remote_pool1/vol2" l2:"$remote_pool2/vol6"
 
   lxc_remote storage volume delete l2:"$remote_pool2" vol2
   lxc_remote storage volume delete l2:"$remote_pool2" vol3
+  lxc_remote storage volume delete l2:"$remote_pool2" vol4
+  lxc_remote storage volume delete l2:"$remote_pool2" vol5
+  lxc_remote storage volume delete l2:"$remote_pool2" vol6
 
   # remote storage volume migration in "push" mode
   lxc_remote storage volume create l1:"$remote_pool1" vol1
+  lxc_remote storage volume create l1:"$remote_pool1" vol2
+  lxc_remote storage volume snapshot l1:"$remote_pool1" vol2
 
   lxc_remote storage volume copy l1:"$remote_pool1/vol1" l2:"$remote_pool2/vol2" --mode=push
   lxc_remote storage volume move l1:"$remote_pool1/vol1" l2:"$remote_pool2/vol3" --mode=push
   ! lxc_remote storage volume list l1:"$remote_pool1/vol1" || false
+  lxc_remote storage volume copy l1:"$remote_pool1/vol2" l2:"$remote_pool2/vol4" --volume-only --mode=push
+  lxc_remote storage volume copy l1:"$remote_pool1/vol2" l2:"$remote_pool2/vol5" --mode=push
+  lxc_remote storage volume move l1:"$remote_pool1/vol2" l2:"$remote_pool2/vol6" --mode=push
 
   lxc_remote storage volume delete l2:"$remote_pool2" vol2
   lxc_remote storage volume delete l2:"$remote_pool2" vol3
+  lxc_remote storage volume delete l2:"$remote_pool2" vol4
+  lxc_remote storage volume delete l2:"$remote_pool2" vol5
+  lxc_remote storage volume delete l2:"$remote_pool2" vol6
 
   # remote storage volume migration in "relay" mode
   lxc_remote storage volume create l1:"$remote_pool1" vol1
+  lxc_remote storage volume create l1:"$remote_pool1" vol2
+  lxc_remote storage volume snapshot l1:"$remote_pool1" vol2
 
   lxc_remote storage volume copy l1:"$remote_pool1/vol1" l2:"$remote_pool2/vol2" --mode=relay
   lxc_remote storage volume move l1:"$remote_pool1/vol1" l2:"$remote_pool2/vol3" --mode=relay
   ! lxc_remote storage volume list l1:"$remote_pool1/vol1" || false
+  lxc_remote storage volume copy l1:"$remote_pool1/vol2" l2:"$remote_pool2/vol4" --volume-only --mode=relay
+  lxc_remote storage volume copy l1:"$remote_pool1/vol2" l2:"$remote_pool2/vol5" --mode=relay
+  lxc_remote storage volume move l1:"$remote_pool1/vol2" l2:"$remote_pool2/vol6" --mode=relay
 
   lxc_remote storage volume delete l2:"$remote_pool2" vol2
   lxc_remote storage volume delete l2:"$remote_pool2" vol3
+  lxc_remote storage volume delete l2:"$remote_pool2" vol4
+  lxc_remote storage volume delete l2:"$remote_pool2" vol5
+  lxc_remote storage volume delete l2:"$remote_pool2" vol6
 
   # Test some migration between projects
   lxc_remote project create l1:proj -c features.images=false -c features.profiles=false

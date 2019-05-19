@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	runtimeDebug "runtime/debug"
 	"strconv"
 	"strings"
 
@@ -20,19 +21,21 @@ import (
 	"github.com/lxc/lxd/lxd/db/cluster"
 	"github.com/lxc/lxd/lxd/db/node"
 	"github.com/lxc/lxd/lxd/db/query"
+	deviceConfig "github.com/lxc/lxd/lxd/device/config"
+	"github.com/lxc/lxd/lxd/project"
+	driver "github.com/lxc/lxd/lxd/storage"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
+	log "github.com/lxc/lxd/shared/log15"
 	"github.com/lxc/lxd/shared/logger"
 	"github.com/lxc/lxd/shared/osarch"
-
-	log "github.com/lxc/lxd/shared/log15"
-	runtimeDebug "runtime/debug"
 )
 
-var apiInternal = []Command{
+var apiInternal = []APIEndpoint{
 	internalReadyCmd,
 	internalShutdownCmd,
 	internalContainerOnStartCmd,
+	internalContainerOnStopNSCmd,
 	internalContainerOnStopCmd,
 	internalContainersCmd,
 	internalSQLCmd,
@@ -44,45 +47,59 @@ var apiInternal = []Command{
 	internalRAFTSnapshotCmd,
 }
 
-var internalShutdownCmd = Command{
-	name: "shutdown",
-	put:  internalShutdown,
+var internalShutdownCmd = APIEndpoint{
+	Name: "shutdown",
+
+	Put: APIEndpointAction{Handler: internalShutdown},
 }
 
-var internalReadyCmd = Command{
-	name: "ready",
-	get:  internalWaitReady,
+var internalReadyCmd = APIEndpoint{
+	Name: "ready",
+
+	Get: APIEndpointAction{Handler: internalWaitReady},
 }
 
-var internalContainerOnStartCmd = Command{
-	name: "containers/{id}/onstart",
-	get:  internalContainerOnStart,
+var internalContainerOnStartCmd = APIEndpoint{
+	Name: "containers/{id}/onstart",
+
+	Get: APIEndpointAction{Handler: internalContainerOnStart},
 }
 
-var internalContainerOnStopCmd = Command{
-	name: "containers/{id}/onstop",
-	get:  internalContainerOnStop,
+var internalContainerOnStopNSCmd = APIEndpoint{
+	Name: "containers/{id}/onstopns",
+
+	Get: APIEndpointAction{Handler: internalContainerOnStopNS},
 }
 
-var internalSQLCmd = Command{
-	name: "sql",
-	get:  internalSQLGet,
-	post: internalSQLPost,
+var internalContainerOnStopCmd = APIEndpoint{
+	Name: "containers/{id}/onstop",
+
+	Get: APIEndpointAction{Handler: internalContainerOnStop},
 }
 
-var internalContainersCmd = Command{
-	name: "containers",
-	post: internalImport,
+var internalSQLCmd = APIEndpoint{
+	Name: "sql",
+
+	Get:  APIEndpointAction{Handler: internalSQLGet},
+	Post: APIEndpointAction{Handler: internalSQLPost},
 }
 
-var internalGarbageCollectorCmd = Command{
-	name: "gc",
-	get:  internalGC,
+var internalContainersCmd = APIEndpoint{
+	Name: "containers",
+
+	Post: APIEndpointAction{Handler: internalImport},
 }
 
-var internalRAFTSnapshotCmd = Command{
-	name: "raft-snapshot",
-	get:  internalRAFTSnapshot,
+var internalGarbageCollectorCmd = APIEndpoint{
+	Name: "gc",
+
+	Get: APIEndpointAction{Handler: internalGC},
+}
+
+var internalRAFTSnapshotCmd = APIEndpoint{
+	Name: "raft-snapshot",
+
+	Get: APIEndpointAction{Handler: internalRAFTSnapshot},
 }
 
 func internalWaitReady(d *Daemon, r *http.Request) Response {
@@ -115,6 +132,32 @@ func internalContainerOnStart(d *Daemon, r *http.Request) Response {
 	err = c.OnStart()
 	if err != nil {
 		logger.Error("The start hook failed", log.Ctx{"container": c.Name(), "err": err})
+		return SmartError(err)
+	}
+
+	return EmptySyncResponse
+}
+
+func internalContainerOnStopNS(d *Daemon, r *http.Request) Response {
+	id, err := strconv.Atoi(mux.Vars(r)["id"])
+	if err != nil {
+		return SmartError(err)
+	}
+
+	target := queryParam(r, "target")
+	if target == "" {
+		target = "unknown"
+	}
+	netns := queryParam(r, "netns")
+
+	c, err := containerLoadById(d.State(), id)
+	if err != nil {
+		return SmartError(err)
+	}
+
+	err = c.OnStopNS(target, netns)
+	if err != nil {
+		logger.Error("The stopns hook failed", log.Ctx{"container": c.Name(), "err": err})
 		return SmartError(err)
 	}
 
@@ -351,7 +394,7 @@ type internalImportPost struct {
 }
 
 func internalImport(d *Daemon, r *http.Request) Response {
-	project := projectParam(r)
+	projectName := projectParam(r)
 
 	req := &internalImportPost{}
 	// Parse the request.
@@ -383,7 +426,7 @@ func internalImport(d *Daemon, r *http.Request) Response {
 	containerMntPoints := []string{}
 	containerPoolName := ""
 	for _, poolName := range storagePoolNames {
-		containerMntPoint := getContainerMountPoint(project, poolName, req.Name)
+		containerMntPoint := driver.GetContainerMountPoint(projectName, poolName, req.Name)
 		if shared.PathExists(containerMntPoint) {
 			containerMntPoints = append(containerMntPoints, containerMntPoint)
 			containerPoolName = poolName
@@ -462,7 +505,7 @@ func internalImport(d *Daemon, r *http.Request) Response {
 			return BadRequest(fmt.Errorf(`The storage pool "%s" `+
 				`the container was detected on does not match `+
 				`the storage pool "%s" specified in the `+
-				`backup file`, backup.Pool.Name, containerPoolName))
+				`backup file`, containerPoolName, backup.Pool.Name))
 		}
 
 		if backup.Pool.Driver != pool.Driver {
@@ -502,7 +545,7 @@ func internalImport(d *Daemon, r *http.Request) Response {
 	if len(backup.Snapshots) > 0 {
 		switch backup.Pool.Driver {
 		case "btrfs":
-			snapshotsDirPath := getSnapshotMountPoint(project, poolName, req.Name)
+			snapshotsDirPath := driver.GetSnapshotMountPoint(projectName, poolName, req.Name)
 			snapshotsDir, err := os.Open(snapshotsDirPath)
 			if err != nil {
 				return InternalError(err)
@@ -514,7 +557,7 @@ func internalImport(d *Daemon, r *http.Request) Response {
 			}
 			snapshotsDir.Close()
 		case "dir":
-			snapshotsDirPath := getSnapshotMountPoint(project, poolName, req.Name)
+			snapshotsDirPath := driver.GetSnapshotMountPoint(projectName, poolName, req.Name)
 			snapshotsDir, err := os.Open(snapshotsDirPath)
 			if err != nil {
 				return InternalError(err)
@@ -555,7 +598,7 @@ func internalImport(d *Daemon, r *http.Request) Response {
 
 			onDiskPoolName := backup.Pool.Config["ceph.osd.pool_name"]
 			snaps, err := cephRBDVolumeListSnapshots(clusterName,
-				onDiskPoolName, projectPrefix(project, req.Name),
+				onDiskPoolName, project.Prefix(projectName, req.Name),
 				storagePoolVolumeTypeNameContainer, userName)
 			if err != nil {
 				if err != db.ErrNoSuchObject {
@@ -605,7 +648,7 @@ func internalImport(d *Daemon, r *http.Request) Response {
 	for _, od = range onDiskSnapshots {
 		inBackupFile := false
 		for _, ib := range backup.Snapshots {
-			_, snapOnlyName, _ := containerGetParentAndSnapshotName(ib.Name)
+			_, snapOnlyName, _ := shared.ContainerGetParentAndSnapshotName(ib.Name)
 			if od == snapOnlyName {
 				inBackupFile = true
 				break
@@ -628,18 +671,18 @@ func internalImport(d *Daemon, r *http.Request) Response {
 		switch backup.Pool.Driver {
 		case "btrfs":
 			snapName := fmt.Sprintf("%s/%s", req.Name, od)
-			err = btrfsSnapshotDeleteInternal(project, poolName, snapName)
+			err = btrfsSnapshotDeleteInternal(projectName, poolName, snapName)
 		case "dir":
 			snapName := fmt.Sprintf("%s/%s", req.Name, od)
-			err = dirSnapshotDeleteInternal(project, poolName, snapName)
+			err = dirSnapshotDeleteInternal(projectName, poolName, snapName)
 		case "lvm":
 			onDiskPoolName := backup.Pool.Config["lvm.vg_name"]
 			if onDiskPoolName == "" {
 				onDiskPoolName = poolName
 			}
 			snapName := fmt.Sprintf("%s/%s", req.Name, od)
-			snapPath := containerPath(snapName, true)
-			err = lvmContainerDeleteInternal(project, poolName, req.Name,
+			snapPath := driver.ContainerPath(snapName, true)
+			err = lvmContainerDeleteInternal(projectName, poolName, req.Name,
 				true, onDiskPoolName, snapPath)
 		case "ceph":
 			clusterName := "ceph"
@@ -653,9 +696,9 @@ func internalImport(d *Daemon, r *http.Request) Response {
 			}
 
 			onDiskPoolName := backup.Pool.Config["ceph.osd.pool_name"]
-			snapName := fmt.Sprintf("snapshot_%s", projectPrefix(project, od))
+			snapName := fmt.Sprintf("snapshot_%s", project.Prefix(projectName, od))
 			ret := cephContainerSnapshotDelete(clusterName,
-				onDiskPoolName, projectPrefix(project, req.Name),
+				onDiskPoolName, project.Prefix(projectName, req.Name),
 				storagePoolVolumeTypeNameContainer, snapName, userName)
 			if ret < 0 {
 				err = fmt.Errorf(`Failed to delete snapshot`)
@@ -663,7 +706,7 @@ func internalImport(d *Daemon, r *http.Request) Response {
 		case "zfs":
 			onDiskPoolName := backup.Pool.Config["zfs.pool_name"]
 			snapName := fmt.Sprintf("%s/%s", req.Name, od)
-			err = zfsSnapshotDeleteInternal(project, poolName, snapName,
+			err = zfsSnapshotDeleteInternal(projectName, poolName, snapName,
 				onDiskPoolName)
 		}
 		if err != nil {
@@ -674,7 +717,7 @@ func internalImport(d *Daemon, r *http.Request) Response {
 	for _, snap := range backup.Snapshots {
 		switch backup.Pool.Driver {
 		case "btrfs":
-			snpMntPt := getSnapshotMountPoint(project, backup.Pool.Name, snap.Name)
+			snpMntPt := driver.GetSnapshotMountPoint(projectName, backup.Pool.Name, snap.Name)
 			if !shared.PathExists(snpMntPt) || !isBtrfsSubVolume(snpMntPt) {
 				if req.Force {
 					continue
@@ -682,7 +725,7 @@ func internalImport(d *Daemon, r *http.Request) Response {
 				return BadRequest(needForce)
 			}
 		case "dir":
-			snpMntPt := getSnapshotMountPoint(project, backup.Pool.Name, snap.Name)
+			snpMntPt := driver.GetSnapshotMountPoint(projectName, backup.Pool.Name, snap.Name)
 			if !shared.PathExists(snpMntPt) {
 				if req.Force {
 					continue
@@ -717,9 +760,9 @@ func internalImport(d *Daemon, r *http.Request) Response {
 			}
 
 			onDiskPoolName := backup.Pool.Config["ceph.osd.pool_name"]
-			ctName, csName, _ := containerGetParentAndSnapshotName(snap.Name)
-			ctName = projectPrefix(project, ctName)
-			csName = projectPrefix(project, csName)
+			ctName, csName, _ := shared.ContainerGetParentAndSnapshotName(snap.Name)
+			ctName = project.Prefix(projectName, ctName)
+			csName = project.Prefix(projectName, csName)
 			snapshotName := fmt.Sprintf("snapshot_%s", csName)
 
 			exists := cephRBDSnapshotExists(clusterName,
@@ -733,7 +776,7 @@ func internalImport(d *Daemon, r *http.Request) Response {
 				return BadRequest(needForce)
 			}
 		case "zfs":
-			ctName, csName, _ := containerGetParentAndSnapshotName(snap.Name)
+			ctName, csName, _ := shared.ContainerGetParentAndSnapshotName(snap.Name)
 			snapshotName := fmt.Sprintf("snapshot-%s", csName)
 
 			exists := zfsFilesystemEntityExists(poolName,
@@ -766,7 +809,7 @@ func internalImport(d *Daemon, r *http.Request) Response {
 	}
 
 	// Check if an entry for the container already exists in the db.
-	_, containerErr := d.cluster.ContainerID(req.Name)
+	_, containerErr := d.cluster.ContainerID(projectName, req.Name)
 	if containerErr != nil {
 		if containerErr != db.ErrNoSuchObject {
 			return SmartError(containerErr)
@@ -811,7 +854,7 @@ func internalImport(d *Daemon, r *http.Request) Response {
 	if containerErr == nil {
 		// Remove the storage volume db entry for the container since
 		// force was specified.
-		err := d.cluster.ContainerRemove(project, req.Name)
+		err := d.cluster.ContainerRemove(projectName, req.Name)
 		if err != nil {
 			return SmartError(err)
 		}
@@ -831,9 +874,67 @@ func internalImport(d *Daemon, r *http.Request) Response {
 	fd.Close()
 	defer os.Remove(fd.Name())
 
+	baseImage := backup.Container.Config["volatile.base_image"]
+
+	// Add root device if missing
+	root, _, _ := shared.GetRootDiskDevice(backup.Container.Devices)
+	if root == "" {
+		if backup.Container.Devices == nil {
+			backup.Container.Devices = map[string]map[string]string{}
+		}
+
+		rootDevName := "root"
+		for i := 0; i < 100; i++ {
+			if backup.Container.Devices[rootDevName] == nil {
+				break
+			}
+			rootDevName = fmt.Sprintf("root%d", i)
+			continue
+		}
+
+		backup.Container.Devices[rootDevName] = rootDev
+	}
+
+	arch, err := osarch.ArchitectureId(backup.Container.Architecture)
+	if err != nil {
+		return SmartError(err)
+	}
+	_, err = containerCreateInternal(d.State(), db.ContainerArgs{
+		Project:      projectName,
+		Architecture: arch,
+		BaseImage:    baseImage,
+		Config:       backup.Container.Config,
+		CreationDate: backup.Container.CreatedAt,
+		Ctype:        db.CTypeRegular,
+		Description:  backup.Container.Description,
+		Devices:      deviceConfig.NewDevices(backup.Container.Devices),
+		Ephemeral:    backup.Container.Ephemeral,
+		LastUsedDate: backup.Container.LastUsedAt,
+		Name:         backup.Container.Name,
+		Profiles:     backup.Container.Profiles,
+		Stateful:     backup.Container.Stateful,
+	})
+	if err != nil {
+		err = errors.Wrap(err, "Create container")
+		return SmartError(err)
+	}
+
+	containerPath := driver.ContainerPath(project.Prefix(projectName, req.Name), false)
+	isPrivileged := false
+	if backup.Container.Config["security.privileged"] == "" {
+		isPrivileged = true
+	}
+	err = driver.CreateContainerMountpoint(containerMntPoint, containerPath,
+		isPrivileged)
+	if err != nil {
+		return InternalError(err)
+	}
+
 	for _, snap := range existingSnapshots {
+		parts := strings.SplitN(snap.Name, shared.SnapshotDelimiter, 2)
+
 		// Check if an entry for the snapshot already exists in the db.
-		_, snapErr := d.cluster.ContainerID(snap.Name)
+		_, snapErr := d.cluster.InstanceSnapshotID(projectName, parts[0], parts[1])
 		if snapErr != nil {
 			if snapErr != db.ErrNoSuchObject {
 				return SmartError(snapErr)
@@ -848,8 +949,8 @@ func internalImport(d *Daemon, r *http.Request) Response {
 		}
 
 		// Check if a storage volume entry for the snapshot already exists.
-		_, _, csVolErr := d.cluster.StoragePoolNodeVolumeGetType(snap.Name,
-			storagePoolVolumeTypeContainer, poolID)
+		_, _, csVolErr := d.cluster.StoragePoolNodeVolumeGetTypeByProject(
+			projectName, snap.Name, storagePoolVolumeTypeContainer, poolID)
 		if csVolErr != nil {
 			if csVolErr != db.ErrNoSuchObject {
 				return SmartError(csVolErr)
@@ -864,14 +965,14 @@ func internalImport(d *Daemon, r *http.Request) Response {
 		}
 
 		if snapErr == nil {
-			err := d.cluster.ContainerRemove(project, snap.Name)
+			err := d.cluster.ContainerRemove(projectName, snap.Name)
 			if err != nil {
 				return SmartError(err)
 			}
 		}
 
 		if csVolErr == nil {
-			err := d.cluster.StoragePoolVolumeDelete("default", snap.Name,
+			err := d.cluster.StoragePoolVolumeDelete(projectName, snap.Name,
 				storagePoolVolumeTypeContainer, poolID)
 			if err != nil {
 				return SmartError(err)
@@ -905,13 +1006,13 @@ func internalImport(d *Daemon, r *http.Request) Response {
 		}
 
 		_, err = containerCreateInternal(d.State(), db.ContainerArgs{
-			Project:      project,
+			Project:      projectName,
 			Architecture: arch,
 			BaseImage:    baseImage,
 			Config:       snap.Config,
 			CreationDate: snap.CreatedAt,
 			Ctype:        db.CTypeSnapshot,
-			Devices:      snap.Devices,
+			Devices:      deviceConfig.NewDevices(snap.Devices),
 			Ephemeral:    snap.Ephemeral,
 			LastUsedDate: snap.LastUsedAt,
 			Name:         snap.Name,
@@ -923,72 +1024,16 @@ func internalImport(d *Daemon, r *http.Request) Response {
 		}
 
 		// Recreate missing mountpoints and symlinks.
-		snapshotMountPoint := getSnapshotMountPoint(project, backup.Pool.Name,
+		snapshotMountPoint := driver.GetSnapshotMountPoint(projectName, backup.Pool.Name,
 			snap.Name)
-		sourceName, _, _ := containerGetParentAndSnapshotName(snap.Name)
-		sourceName = projectPrefix(project, sourceName)
+		sourceName, _, _ := shared.ContainerGetParentAndSnapshotName(snap.Name)
+		sourceName = project.Prefix(projectName, sourceName)
 		snapshotMntPointSymlinkTarget := shared.VarPath("storage-pools", backup.Pool.Name, "containers-snapshots", sourceName)
 		snapshotMntPointSymlink := shared.VarPath("snapshots", sourceName)
-		err = createSnapshotMountpoint(snapshotMountPoint, snapshotMntPointSymlinkTarget, snapshotMntPointSymlink)
+		err = driver.CreateSnapshotMountpoint(snapshotMountPoint, snapshotMntPointSymlinkTarget, snapshotMntPointSymlink)
 		if err != nil {
 			return InternalError(err)
 		}
-	}
-
-	baseImage := backup.Container.Config["volatile.base_image"]
-
-	// Add root device if missing
-	root, _, _ := shared.GetRootDiskDevice(backup.Container.Devices)
-	if root == "" {
-		if backup.Container.Devices == nil {
-			backup.Container.Devices = map[string]map[string]string{}
-		}
-
-		rootDevName := "root"
-		for i := 0; i < 100; i++ {
-			if backup.Container.Devices[rootDevName] == nil {
-				break
-			}
-			rootDevName = fmt.Sprintf("root%d", i)
-			continue
-		}
-
-		backup.Container.Devices[rootDevName] = rootDev
-	}
-
-	arch, err := osarch.ArchitectureId(backup.Container.Architecture)
-	if err != nil {
-		return SmartError(err)
-	}
-	_, err = containerCreateInternal(d.State(), db.ContainerArgs{
-		Project:      project,
-		Architecture: arch,
-		BaseImage:    baseImage,
-		Config:       backup.Container.Config,
-		CreationDate: backup.Container.CreatedAt,
-		Ctype:        db.CTypeRegular,
-		Description:  backup.Container.Description,
-		Devices:      backup.Container.Devices,
-		Ephemeral:    backup.Container.Ephemeral,
-		LastUsedDate: backup.Container.LastUsedAt,
-		Name:         backup.Container.Name,
-		Profiles:     backup.Container.Profiles,
-		Stateful:     backup.Container.Stateful,
-	})
-	if err != nil {
-		err = errors.Wrap(err, "Create container")
-		return SmartError(err)
-	}
-
-	containerPath := containerPath(projectPrefix(project, req.Name), false)
-	isPrivileged := false
-	if backup.Container.Config["security.privileged"] == "" {
-		isPrivileged = true
-	}
-	err = createContainerMountpoint(containerMntPoint, containerPath,
-		isPrivileged)
-	if err != nil {
-		return InternalError(err)
 	}
 
 	return EmptySyncResponse

@@ -36,8 +36,8 @@ type cmdGlobal struct {
 
 func (c *cmdGlobal) Run(cmd *cobra.Command, args []string) error {
 	// Set logging global variables
-	debug = c.flagLogVerbose
-	verbose = c.flagLogDebug
+	debug = c.flagLogDebug
+	verbose = c.flagLogVerbose
 
 	// Setup logger
 	syslog := ""
@@ -107,6 +107,10 @@ func main() {
 	// forkmigrate sub-command
 	forkmigrateCmd := cmdForkmigrate{global: &globalCmd}
 	app.AddCommand(forkmigrateCmd.Command())
+
+	// forksyscall sub-command
+	forksyscallCmd := cmdForksyscall{global: &globalCmd}
+	app.AddCommand(forksyscallCmd.Command())
 
 	// forkmount sub-command
 	forkmountCmd := cmdForkmount{global: &globalCmd}
