@@ -4,7 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 
-	"github.com/lxc/lxd/lxd/types"
+	"github.com/lxc/lxd/lxd/device/config"
 )
 
 func dbDeviceTypeToString(t int) (string, error) {
@@ -58,7 +58,7 @@ func dbDeviceTypeToInt(t string) (int, error) {
 }
 
 // DevicesAdd adds a new device.
-func DevicesAdd(tx *sql.Tx, w string, cID int64, devices types.Devices) error {
+func DevicesAdd(tx *sql.Tx, w string, cID int64, devices config.Devices) error {
 	// Prepare the devices entry SQL
 	str1 := fmt.Sprintf("INSERT INTO %ss_devices (%s_id, name, type) VALUES (?, ?, ?)", w, w)
 	stmt1, err := tx.Prepare(str1)
@@ -95,7 +95,7 @@ func DevicesAdd(tx *sql.Tx, w string, cID int64, devices types.Devices) error {
 
 		for ck, cv := range v {
 			// The type is stored as int in the parent entry
-			if ck == "type" {
+			if ck == "type" || cv == "" {
 				continue
 			}
 
@@ -109,17 +109,17 @@ func DevicesAdd(tx *sql.Tx, w string, cID int64, devices types.Devices) error {
 	return nil
 }
 
-func dbDeviceConfig(db *sql.DB, id int, isprofile bool) (types.Device, error) {
+func dbDeviceConfig(db *sql.DB, id int, isprofile bool) (config.Device, error) {
 	var query string
 	var key, value string
-	newdev := types.Device{} // That's a map[string]string
+	newdev := config.Device{} // That's a map[string]string
 	inargs := []interface{}{id}
 	outfmt := []interface{}{key, value}
 
 	if isprofile {
 		query = `SELECT key, value FROM profiles_devices_config WHERE profile_device_id=?`
 	} else {
-		query = `SELECT key, value FROM containers_devices_config WHERE container_device_id=?`
+		query = `SELECT key, value FROM instances_devices_config WHERE instance_device_id=?`
 	}
 
 	results, err := queryScan(db, query, inargs, outfmt)
@@ -138,7 +138,7 @@ func dbDeviceConfig(db *sql.DB, id int, isprofile bool) (types.Device, error) {
 }
 
 // Devices returns the devices matching the given filters.
-func (c *Cluster) Devices(project, qName string, isprofile bool) (types.Devices, error) {
+func (c *Cluster) Devices(project, qName string, isprofile bool) (config.Devices, error) {
 	err := c.Transaction(func(tx *ClusterTx) error {
 		enabled, err := tx.ProjectHasProfiles(project)
 		if err != nil {
@@ -161,11 +161,11 @@ func (c *Cluster) Devices(project, qName string, isprofile bool) (types.Devices,
                         JOIN projects ON projects.id=profiles.project_id
    		WHERE projects.name=? AND profiles.name=?`
 	} else {
-		q = `SELECT containers_devices.id, containers_devices.name, containers_devices.type
-			FROM containers_devices
-                        JOIN containers	ON containers_devices.container_id = containers.id
-                        JOIN projects ON projects.id=containers.project_id
-			WHERE projects.name=? AND containers.name=?`
+		q = `SELECT instances_devices.id, instances_devices.name, instances_devices.type
+			FROM instances_devices
+                        JOIN instances	ON instances_devices.instance_id = instances.id
+                        JOIN projects ON projects.id=instances.project_id
+			WHERE projects.name=? AND instances.name=?`
 	}
 	var id, dtype int
 	var name, stype string
@@ -176,7 +176,7 @@ func (c *Cluster) Devices(project, qName string, isprofile bool) (types.Devices,
 		return nil, err
 	}
 
-	devices := types.Devices{}
+	devices := config.Devices{}
 	for _, r := range results {
 		id = r[0].(int)
 		name = r[1].(string)

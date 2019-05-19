@@ -11,8 +11,8 @@ import (
 	"os"
 	"time"
 
-	dqlite "github.com/CanonicalLtd/go-dqlite"
-	"github.com/mattn/go-sqlite3"
+	"github.com/canonical/go-dqlite/driver"
+	sqlite3 "github.com/mattn/go-sqlite3"
 	"github.com/pkg/errors"
 
 	lxd "github.com/lxc/lxd/client"
@@ -518,16 +518,30 @@ func PreconditionFailed(err error) Response {
  * SmartError returns the right error message based on err.
  */
 func SmartError(err error) Response {
-	switch errors.Cause(err) {
-	case nil:
+	if err == nil {
 		return EmptySyncResponse
+	}
+
+	switch errors.Cause(err) {
 	case os.ErrNotExist, sql.ErrNoRows, db.ErrNoSuchObject:
+		if errors.Cause(err) != err {
+			return NotFound(err)
+		}
+
 		return NotFound(nil)
 	case os.ErrPermission:
+		if errors.Cause(err) != err {
+			return Forbidden(err)
+		}
+
 		return Forbidden(nil)
 	case db.ErrAlreadyDefined, sqlite3.ErrConstraintUnique:
+		if errors.Cause(err) != err {
+			return Conflict(err)
+		}
+
 		return Conflict(nil)
-	case dqlite.ErrNoAvailableLeader:
+	case driver.ErrNoAvailableLeader:
 		return Unavailable(err)
 	default:
 		return InternalError(err)

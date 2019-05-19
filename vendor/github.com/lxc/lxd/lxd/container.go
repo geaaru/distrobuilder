@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -10,18 +11,18 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/net/context"
-	"gopkg.in/lxc/go-lxc.v2"
-	"gopkg.in/robfig/cron.v2"
+	"github.com/pkg/errors"
+	lxc "gopkg.in/lxc/go-lxc.v2"
+	cron "gopkg.in/robfig/cron.v2"
 
 	"github.com/flosch/pongo2"
 	"github.com/lxc/lxd/lxd/cluster"
 	"github.com/lxc/lxd/lxd/db"
+	"github.com/lxc/lxd/lxd/device"
+	"github.com/lxc/lxd/lxd/device/config"
 	"github.com/lxc/lxd/lxd/state"
 	"github.com/lxc/lxd/lxd/sys"
 	"github.com/lxc/lxd/lxd/task"
-	"github.com/lxc/lxd/lxd/types"
-	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/idmap"
@@ -29,29 +30,39 @@ import (
 	log "github.com/lxc/lxd/shared/log15"
 	"github.com/lxc/lxd/shared/logger"
 	"github.com/lxc/lxd/shared/osarch"
-	"github.com/pkg/errors"
+	"github.com/lxc/lxd/shared/units"
 )
 
+func init() {
+	// Expose containerLoadNodeAll to the device package converting the response to a slice of InstanceIdentifiers.
+	// This is because container types are defined in the main package and are not importable.
+	device.InstanceLoadNodeAll = func(s *state.State) ([]device.InstanceIdentifier, error) {
+		containers, err := containerLoadNodeAll(s)
+		if err != nil {
+			return nil, err
+		}
+
+		identifiers := []device.InstanceIdentifier{}
+		for _, v := range containers {
+			identifiers = append(identifiers, device.InstanceIdentifier(v))
+		}
+
+		return identifiers, nil
+	}
+
+	// Expose containerLoadByProjectAndName to the device package converting the response to an InstanceIdentifier.
+	// This is because container types are defined in the main package and are not importable.
+	device.InstanceLoadByProjectAndName = func(s *state.State, project, name string) (device.InstanceIdentifier, error) {
+		container, err := containerLoadByProjectAndName(s, project, name)
+		if err != nil {
+			return nil, err
+		}
+
+		return device.InstanceIdentifier(container), nil
+	}
+}
+
 // Helper functions
-
-// Returns the parent container name, snapshot name, and whether it actually was
-// a snapshot name.
-func containerGetParentAndSnapshotName(name string) (string, string, bool) {
-	fields := strings.SplitN(name, shared.SnapshotDelimiter, 2)
-	if len(fields) == 1 {
-		return name, "", false
-	}
-
-	return fields[0], fields[1], true
-}
-
-func containerPath(name string, isSnapshot bool) string {
-	if isSnapshot {
-		return shared.VarPath("snapshots", name)
-	}
-
-	return shared.VarPath("containers", name)
-}
 
 func containerValidName(name string) error {
 	if strings.Contains(name, shared.SnapshotDelimiter) {
@@ -89,180 +100,6 @@ func containerValidConfigKey(os *sys.OS, key string, value string) error {
 		return fmt.Errorf("security.syscalls.blacklist_compat isn't supported on this architecture")
 	}
 	return nil
-}
-
-var containerNetworkLimitKeys = []string{"limits.max", "limits.ingress", "limits.egress"}
-
-func containerValidDeviceConfigKey(t, k string) bool {
-	if k == "type" {
-		return true
-	}
-
-	switch t {
-	case "unix-char", "unix-block":
-		switch k {
-		case "gid":
-			return true
-		case "major":
-			return true
-		case "minor":
-			return true
-		case "mode":
-			return true
-		case "source":
-			return true
-		case "path":
-			return true
-		case "required":
-			return true
-		case "uid":
-			return true
-		default:
-			return false
-		}
-	case "nic":
-		switch k {
-		case "limits.max":
-			return true
-		case "limits.ingress":
-			return true
-		case "limits.egress":
-			return true
-		case "host_name":
-			return true
-		case "hwaddr":
-			return true
-		case "mtu":
-			return true
-		case "name":
-			return true
-		case "nictype":
-			return true
-		case "parent":
-			return true
-		case "vlan":
-			return true
-		case "ipv4.address":
-			return true
-		case "ipv6.address":
-			return true
-		case "security.mac_filtering":
-			return true
-		case "maas.subnet.ipv4":
-			return true
-		case "maas.subnet.ipv6":
-			return true
-		default:
-			return false
-		}
-	case "disk":
-		switch k {
-		case "limits.max":
-			return true
-		case "limits.read":
-			return true
-		case "limits.write":
-			return true
-		case "optional":
-			return true
-		case "path":
-			return true
-		case "readonly":
-			return true
-		case "size":
-			return true
-		case "source":
-			return true
-		case "recursive":
-			return true
-		case "pool":
-			return true
-		case "propagation":
-			return true
-		default:
-			return false
-		}
-	case "usb":
-		switch k {
-		case "vendorid":
-			return true
-		case "productid":
-			return true
-		case "mode":
-			return true
-		case "gid":
-			return true
-		case "uid":
-			return true
-		case "required":
-			return true
-		default:
-			return false
-		}
-	case "gpu":
-		switch k {
-		case "vendorid":
-			return true
-		case "productid":
-			return true
-		case "id":
-			return true
-		case "pci":
-			return true
-		case "mode":
-			return true
-		case "gid":
-			return true
-		case "uid":
-			return true
-		default:
-			return false
-		}
-	case "infiniband":
-		switch k {
-		case "hwaddr":
-			return true
-		case "mtu":
-			return true
-		case "name":
-			return true
-		case "nictype":
-			return true
-		case "parent":
-			return true
-		default:
-			return false
-		}
-	case "proxy":
-		switch k {
-		case "bind":
-			return true
-		case "connect":
-			return true
-		case "gid":
-			return true
-		case "listen":
-			return true
-		case "mode":
-			return true
-		case "proxy_protocol":
-			return true
-		case "nat":
-			return true
-		case "security.gid":
-			return true
-		case "security.uid":
-			return true
-		case "uid":
-			return true
-		default:
-			return false
-		}
-	case "none":
-		return false
-	default:
-		return false
-	}
 }
 
 func allowedUnprivilegedOnlyMap(rawIdmap string) error {
@@ -335,224 +172,37 @@ func containerValidConfig(sysOS *sys.OS, config map[string]string, profile bool,
 	return nil
 }
 
-func containerValidDevices(cluster *db.Cluster, devices types.Devices, profile bool, expanded bool) error {
+// containerValidDevices validate container device configs.
+func containerValidDevices(state *state.State, cluster *db.Cluster, instanceName string, devices config.Devices, expanded bool) error {
 	// Empty device list
 	if devices == nil {
 		return nil
 	}
 
-	var diskDevicePaths []string
-	// Check each device individually
-	for name, m := range devices {
-		if m["type"] == "" {
-			return fmt.Errorf("Missing device type for device '%s'", name)
-		}
-
-		if !shared.StringInSlice(m["type"], []string{"disk", "gpu", "infiniband", "nic", "none", "proxy", "unix-block", "unix-char", "usb"}) {
-			return fmt.Errorf("Invalid device type for device '%s'", name)
-		}
-
-		for k := range m {
-			if !containerValidDeviceConfigKey(m["type"], k) {
-				return fmt.Errorf("Invalid device configuration key for %s: %s", m["type"], k)
-			}
-		}
-
-		if m["type"] == "nic" {
-			if m["nictype"] == "" {
-				return fmt.Errorf("Missing nic type")
-			}
-
-			if !shared.StringInSlice(m["nictype"], []string{"bridged", "macvlan", "p2p", "physical", "sriov"}) {
-				return fmt.Errorf("Bad nic type: %s", m["nictype"])
-			}
-
-			if shared.StringInSlice(m["nictype"], []string{"bridged", "macvlan", "physical", "sriov"}) && m["parent"] == "" {
-				return fmt.Errorf("Missing parent for %s type nic", m["nictype"])
-			}
-
-			if m["ipv4.address"] != "" {
-				err := networkValidAddressV4(m["ipv4.address"])
-				if err != nil {
-					return err
-				}
-			}
-
-			if m["ipv6.address"] != "" {
-				err := networkValidAddressV6(m["ipv6.address"])
-				if err != nil {
-					return err
-				}
-			}
-		} else if m["type"] == "infiniband" {
-			if m["nictype"] == "" {
-				return fmt.Errorf("Missing nic type")
-			}
-
-			if !shared.StringInSlice(m["nictype"], []string{"physical", "sriov"}) {
-				return fmt.Errorf("Bad nic type: %s", m["nictype"])
-			}
-
-			if m["parent"] == "" {
-				return fmt.Errorf("Missing parent for %s type nic", m["nictype"])
-			}
-		} else if m["type"] == "disk" {
-			if !expanded && !shared.StringInSlice(m["path"], diskDevicePaths) {
-				diskDevicePaths = append(diskDevicePaths, m["path"])
-			} else if !expanded {
-				return fmt.Errorf("More than one disk device uses the same path: %s", m["path"])
-			}
-
-			if m["path"] == "" {
-				return fmt.Errorf("Disk entry is missing the required \"path\" property")
-			}
-
-			if m["source"] == "" && m["path"] != "/" {
-				return fmt.Errorf("Disk entry is missing the required \"source\" property")
-			}
-
-			if m["path"] == "/" && m["source"] != "" {
-				return fmt.Errorf("Root disk entry may not have a \"source\" property set")
-			}
-
-			if m["size"] != "" && m["path"] != "/" {
-				return fmt.Errorf("Only the root disk may have a size quota")
-			}
-
-			if (m["path"] == "/" || !shared.IsDir(shared.HostPath(m["source"]))) && m["recursive"] != "" {
-				return fmt.Errorf("The recursive option is only supported for additional bind-mounted paths")
-			}
-
-			if m["pool"] != "" {
-				if filepath.IsAbs(m["source"]) {
-					return fmt.Errorf("Storage volumes cannot be specified as absolute paths")
-				}
-
-				_, err := cluster.StoragePoolGetID(m["pool"])
-				if err != nil {
-					return fmt.Errorf("The \"%s\" storage pool doesn't exist", m["pool"])
-				}
-
-				if !profile && expanded && m["source"] != "" && m["path"] != "/" {
-					isAvailable, err := cluster.StorageVolumeIsAvailable(
-						m["pool"], m["source"])
-					if err != nil {
-						return errors.Wrap(err, "Check if volume is available")
-					}
-					if !isAvailable {
-						return fmt.Errorf(
-							"Storage volume %q is already attached to a container "+
-								"on a different node", m["source"])
-					}
-				}
-			}
-
-			if m["propagation"] != "" {
-				if !util.RuntimeLiblxcVersionAtLeast(3, 0, 0) {
-					return fmt.Errorf("liblxc 3.0 is required for mount propagation configuration")
-				}
-
-				if !shared.StringInSlice(m["propagation"], []string{"private", "shared", "slave", "unbindable", "rprivate", "rshared", "rslave", "runbindable"}) {
-					return fmt.Errorf("Invalid propagation mode '%s'", m["propagation"])
-				}
-			}
-		} else if shared.StringInSlice(m["type"], []string{"unix-char", "unix-block"}) {
-			if m["source"] == "" && m["path"] == "" {
-				return fmt.Errorf("Unix device entry is missing the required \"source\" or \"path\" property")
-			}
-
-			if (m["required"] == "" || shared.IsTrue(m["required"])) && (m["major"] == "" || m["minor"] == "") {
-				srcPath, exist := m["source"]
-				if !exist {
-					srcPath = m["path"]
-				}
-				if !shared.PathExists(srcPath) {
-					return fmt.Errorf("The device path doesn't exist on the host and major/minor wasn't specified")
-				}
-
-				dType, _, _, err := deviceGetAttributes(srcPath)
-				if err != nil {
-					return err
-				}
-
-				if m["type"] == "unix-char" && dType != "c" {
-					return fmt.Errorf("Path specified for unix-char device is a block device")
-				}
-
-				if m["type"] == "unix-block" && dType != "b" {
-					return fmt.Errorf("Path specified for unix-block device is a character device")
-				}
-			}
-		} else if m["type"] == "usb" {
-			// Nothing needed for usb.
-		} else if m["type"] == "gpu" {
-			if m["pci"] != "" && !shared.PathExists(fmt.Sprintf("/sys/bus/pci/devices/%s", m["pci"])) {
-				return fmt.Errorf("Invalid PCI address (no device found): %s", m["pci"])
-			}
-
-			if m["pci"] != "" && (m["id"] != "" || m["productid"] != "" || m["vendorid"] != "") {
-				return fmt.Errorf("Cannot use id, productid or vendorid when pci is set")
-			}
-
-			if m["id"] != "" && (m["pci"] != "" || m["productid"] != "" || m["vendorid"] != "") {
-				return fmt.Errorf("Cannot use pci, productid or vendorid when id is set")
-			}
-		} else if m["type"] == "proxy" {
-			if m["listen"] == "" {
-				return fmt.Errorf("Proxy device entry is missing the required \"listen\" property")
-			}
-
-			if m["connect"] == "" {
-				return fmt.Errorf("Proxy device entry is missing the required \"connect\" property")
-			}
-
-			listenAddr, err := parseAddr(m["listen"])
-			if err != nil {
-				return err
-			}
-
-			connectAddr, err := parseAddr(m["connect"])
-			if err != nil {
-				return err
-			}
-
-			if len(connectAddr.addr) > len(listenAddr.addr) {
-				// Cannot support single port -> multiple port
-				return fmt.Errorf("Cannot map a single port to multiple ports")
-			}
-
-			if shared.IsTrue(m["proxy_protocol"]) && !strings.HasPrefix(m["connect"], "tcp") {
-				return fmt.Errorf("The PROXY header can only be sent to tcp servers")
-			}
-
-			if (!strings.HasPrefix(m["listen"], "unix:") || strings.HasPrefix(m["listen"], "unix:@")) &&
-				(m["uid"] != "" || m["gid"] != "" || m["mode"] != "") {
-				return fmt.Errorf("Only proxy devices for non-abstract unix sockets can carry uid, gid, or mode properties")
-			}
-
-			if shared.IsTrue(m["nat"]) {
-				if m["bind"] != "" && m["bind"] != "host" {
-					return fmt.Errorf("Only host-bound proxies can use NAT")
-				}
-
-				// Support TCP <-> TCP and UDP <-> UDP
-				if listenAddr.connType == "unix" || connectAddr.connType == "unix" ||
-					listenAddr.connType != connectAddr.connType {
-					return fmt.Errorf("Proxying %s <-> %s is not supported when using NAT",
-						listenAddr.connType, connectAddr.connType)
-				}
-			}
-
-		} else if m["type"] == "none" {
-			continue
-		} else {
-			return fmt.Errorf("Invalid device type: %s", m["type"])
-		}
+	// Create a temporary containerLXC struct to use as an Instance in device validation.
+	// Populate it's name, localDevices and expandedDevices properties based on the mode of
+	// validation occurring. In non-expanded validation expensive checks should be avoided.
+	instance := &containerLXC{
+		name:         instanceName,
+		localDevices: devices.Clone(), // Prevent devices from modifying their config.
 	}
 
-	// Checks on the expanded config
 	if expanded {
-		_, _, err := shared.GetRootDiskDevice(devices)
+		instance.expandedDevices = instance.localDevices // Avoid another clone.
+	}
+
+	// Check each device individually using the device package.
+	for name, config := range devices {
+		_, err := device.New(instance, state, name, config, nil, nil)
+		if err != nil {
+			return err
+		}
+
+	}
+
+	// Check we have a root disk if in expanded validation mode.
+	if expanded {
+		_, _, err := shared.GetRootDiskDevice(devices.CloneNative())
 		if err != nil {
 			return errors.Wrap(err, "Detect root disk device")
 		}
@@ -589,7 +239,7 @@ type container interface {
 	// Live configuration
 	CGroupGet(key string) (string, error)
 	CGroupSet(key string, value string) error
-	ConfigKeySet(key string, value string) error
+	VolatileSet(changes map[string]string) error
 
 	// File handling
 	FileExists(path string) error
@@ -617,7 +267,7 @@ type container interface {
 	         *      (the PID returned in the first return argument). It can however
 	         *      be used to e.g. forward signals.)
 	*/
-	Exec(command []string, env map[string]string, stdin *os.File, stdout *os.File, stderr *os.File, wait bool) (*exec.Cmd, int, int, error)
+	Exec(command []string, env map[string]string, stdin *os.File, stdout *os.File, stderr *os.File, wait bool, cwd string, uid uint32, gid uint32) (*exec.Cmd, int, int, error)
 
 	// Status
 	Render() (interface{}, interface{}, error)
@@ -633,21 +283,24 @@ type container interface {
 
 	// Hooks
 	OnStart() error
+	OnStopNS(target string, netns string) error
 	OnStop(target string) error
+	DeviceEventHandler(*device.RunConfig) error
 
 	// Properties
 	Id() int
 	Location() string
 	Project() string
 	Name() string
+	Type() string
 	Description() string
 	Architecture() int
 	CreationDate() time.Time
 	LastUsedDate() time.Time
 	ExpandedConfig() map[string]string
-	ExpandedDevices() types.Devices
+	ExpandedDevices() config.Devices
 	LocalConfig() map[string]string
-	LocalDevices() types.Devices
+	LocalDevices() config.Devices
 	Profiles() []string
 	InitPID() int
 	State() string
@@ -661,6 +314,7 @@ type container interface {
 	LogFilePath() string
 	ConsoleBufferLogPath() string
 	LogPath() string
+	DevicesPath() string
 
 	// Storage
 	StoragePool() (string, error)
@@ -675,6 +329,7 @@ type container interface {
 	Storage() storage
 	TemplateApply(trigger string) error
 	DaemonState() *state.State
+	InsertSeccompUnixDevice(prefix string, m config.Device, pid int) error
 
 	CurrentIdmap() (*idmap.IdmapSet, error)
 	DiskIdmap() (*idmap.IdmapSet, error)
@@ -890,7 +545,7 @@ func containerCreateAsCopy(s *state.State, args db.ContainerArgs, sourceContaine
 	// retrieve it from the expanded devices.
 	parentStoragePool := ""
 	parentExpandedDevices := ct.ExpandedDevices()
-	parentLocalRootDiskDeviceKey, parentLocalRootDiskDevice, _ := shared.GetRootDiskDevice(parentExpandedDevices)
+	parentLocalRootDiskDeviceKey, parentLocalRootDiskDevice, _ := shared.GetRootDiskDevice(parentExpandedDevices.CloneNative())
 	if parentLocalRootDiskDeviceKey != "" {
 		parentStoragePool = parentLocalRootDiskDevice["pool"]
 	}
@@ -936,7 +591,7 @@ func containerCreateAsCopy(s *state.State, args db.ContainerArgs, sourceContaine
 			// do anything.
 			snapDevices := snap.LocalDevices()
 			if snapDevices != nil {
-				snapLocalRootDiskDeviceKey, _, _ := shared.GetRootDiskDevice(snapDevices)
+				snapLocalRootDiskDeviceKey, _, _ := shared.GetRootDiskDevice(snapDevices.CloneNative())
 				if snapLocalRootDiskDeviceKey != "" {
 					snapDevices[snapLocalRootDiskDeviceKey]["pool"] = parentStoragePool
 				} else {
@@ -1087,13 +742,14 @@ func containerCreateAsSnapshot(s *state.State, args db.ContainerArgs, sourceCont
 		return nil, err
 	}
 
-	ourStart, err := c.StorageStart()
+	// Attempt to update backup.yaml on container
+	ourStart, err := sourceContainer.StorageStart()
 	if err != nil {
 		c.Delete()
 		return nil, err
 	}
 	if ourStart {
-		defer c.StorageStop()
+		defer sourceContainer.StorageStop()
 	}
 
 	err = writeBackupFile(sourceContainer)
@@ -1135,7 +791,7 @@ func containerCreateInternal(s *state.State, args db.ContainerArgs) (container, 
 	}
 
 	if args.Devices == nil {
-		args.Devices = types.Devices{}
+		args.Devices = config.Devices{}
 	}
 
 	if args.Architecture == 0 {
@@ -1159,8 +815,8 @@ func containerCreateInternal(s *state.State, args db.ContainerArgs) (container, 
 		return nil, err
 	}
 
-	// Validate container devices
-	err = containerValidDevices(s.Cluster, args.Devices, false, false)
+	// Validate container devices with the supplied container name and devices.
+	err = containerValidDevices(s, s.Cluster, args.Name, args.Devices, false)
 	if err != nil {
 		return nil, errors.Wrap(err, "Invalid devices")
 	}
@@ -1202,7 +858,7 @@ func containerCreateInternal(s *state.State, args db.ContainerArgs) (container, 
 		args.LastUsedDate = time.Unix(0, 0).UTC()
 	}
 
-	var container db.Container
+	var container db.Instance
 	err = s.Cluster.Transaction(func(tx *db.ClusterTx) error {
 		node, err := tx.NodeName()
 		if err != nil {
@@ -1219,8 +875,43 @@ func containerCreateInternal(s *state.State, args db.ContainerArgs) (container, 
 			return fmt.Errorf("Project %q does not exist", args.Project)
 		}
 
+		if args.Ctype == db.CTypeSnapshot {
+			parts := strings.SplitN(args.Name, shared.SnapshotDelimiter, 2)
+			instanceName := parts[0]
+			snapshotName := parts[1]
+			instance, err := tx.InstanceGet(args.Project, instanceName)
+			if err != nil {
+				return fmt.Errorf("Get instance %q in project %q", instanceName, args.Project)
+			}
+			snapshot := db.InstanceSnapshot{
+				Project:      args.Project,
+				Instance:     instanceName,
+				Name:         snapshotName,
+				CreationDate: args.CreationDate,
+				Stateful:     args.Stateful,
+				Description:  args.Description,
+				Config:       args.Config,
+				Devices:      args.Devices.CloneNative(),
+				ExpiryDate:   args.ExpiryDate,
+			}
+			_, err = tx.InstanceSnapshotCreate(snapshot)
+			if err != nil {
+				return errors.Wrap(err, "Add snapshot info to the database")
+			}
+
+			// Read back the snapshot, to get ID and creation time.
+			s, err := tx.InstanceSnapshotGet(args.Project, instanceName, snapshotName)
+			if err != nil {
+				return errors.Wrap(err, "Fetch created snapshot from the database")
+			}
+
+			container = db.InstanceSnapshotToInstance(instance, s)
+
+			return nil
+		}
+
 		// Create the container entry
-		container = db.Container{
+		container = db.Instance{
 			Project:      args.Project,
 			Name:         args.Name,
 			Node:         node,
@@ -1232,18 +923,18 @@ func containerCreateInternal(s *state.State, args db.ContainerArgs) (container, 
 			LastUseDate:  args.LastUsedDate,
 			Description:  args.Description,
 			Config:       args.Config,
-			Devices:      args.Devices,
+			Devices:      args.Devices.CloneNative(),
 			Profiles:     args.Profiles,
 			ExpiryDate:   args.ExpiryDate,
 		}
 
-		_, err = tx.ContainerCreate(container)
+		_, err = tx.InstanceCreate(container)
 		if err != nil {
 			return errors.Wrap(err, "Add container info to the database")
 		}
 
 		// Read back the container, to get ID and creation time.
-		c, err := tx.ContainerGet(args.Project, args.Name)
+		c, err := tx.InstanceGet(args.Project, args.Name)
 		if err != nil {
 			return errors.Wrap(err, "Fetch created container from the database")
 		}
@@ -1284,7 +975,7 @@ func containerCreateInternal(s *state.State, args db.ContainerArgs) (container, 
 
 func containerConfigureInternal(c container) error {
 	// Find the root device
-	_, rootDiskDevice, err := shared.GetRootDiskDevice(c.ExpandedDevices())
+	_, rootDiskDevice, err := shared.GetRootDiskDevice(c.ExpandedDevices().CloneNative())
 	if err != nil {
 		return err
 	}
@@ -1299,12 +990,12 @@ func containerConfigureInternal(c container) error {
 	if rootDiskDevice["size"] != "" {
 		storageTypeName := storage.GetStorageTypeName()
 		if (storageTypeName == "lvm" || storageTypeName == "ceph") && c.IsRunning() {
-			err = c.ConfigKeySet("volatile.apply_quota", rootDiskDevice["size"])
+			err = c.VolatileSet(map[string]string{"volatile.apply_quota": rootDiskDevice["size"]})
 			if err != nil {
 				return err
 			}
 		} else {
-			size, err := shared.ParseByteSizeString(rootDiskDevice["size"])
+			size, err := units.ParseByteSizeString(rootDiskDevice["size"])
 			if err != nil {
 				return err
 			}
@@ -1340,13 +1031,32 @@ func containerLoadById(s *state.State, id int) (container, error) {
 
 func containerLoadByProjectAndName(s *state.State, project, name string) (container, error) {
 	// Get the DB record
-	var container *db.Container
+	var container *db.Instance
 	err := s.Cluster.Transaction(func(tx *db.ClusterTx) error {
 		var err error
 
-		container, err = tx.ContainerGet(project, name)
-		if err != nil {
-			return errors.Wrapf(err, "Failed to fetch container %q in project %q", name, project)
+		if strings.Contains(name, shared.SnapshotDelimiter) {
+			parts := strings.SplitN(name, shared.SnapshotDelimiter, 2)
+			instanceName := parts[0]
+			snapshotName := parts[1]
+
+			instance, err := tx.InstanceGet(project, instanceName)
+			if err != nil {
+				return errors.Wrapf(err, "Failed to fetch instance %q in project %q", name, project)
+			}
+
+			snapshot, err := tx.InstanceSnapshotGet(project, instanceName, snapshotName)
+			if err != nil {
+				return errors.Wrapf(err, "Failed to fetch snapshot %q of instance %q in project %q", snapshotName, instanceName, project)
+			}
+
+			c := db.InstanceSnapshotToInstance(instance, snapshot)
+			container = &c
+		} else {
+			container, err = tx.InstanceGet(project, name)
+			if err != nil {
+				return errors.Wrapf(err, "Failed to fetch container %q in project %q", name, project)
+			}
 		}
 
 		return nil
@@ -1367,14 +1077,14 @@ func containerLoadByProjectAndName(s *state.State, project, name string) (contai
 
 func containerLoadByProject(s *state.State, project string) ([]container, error) {
 	// Get all the containers
-	var cts []db.Container
+	var cts []db.Instance
 	err := s.Cluster.Transaction(func(tx *db.ClusterTx) error {
-		filter := db.ContainerFilter{
+		filter := db.InstanceFilter{
 			Project: project,
 			Type:    int(db.CTypeRegular),
 		}
 		var err error
-		cts, err = tx.ContainerList(filter)
+		cts, err = tx.InstanceList(filter)
 		if err != nil {
 			return err
 		}
@@ -1421,7 +1131,7 @@ func containerLoadAll(s *state.State) ([]container, error) {
 // Load all containers of this nodes.
 func containerLoadNodeAll(s *state.State) ([]container, error) {
 	// Get all the container arguments
-	var cts []db.Container
+	var cts []db.Instance
 	err := s.Cluster.Transaction(func(tx *db.ClusterTx) error {
 		var err error
 		cts, err = tx.ContainerNodeList()
@@ -1441,7 +1151,7 @@ func containerLoadNodeAll(s *state.State) ([]container, error) {
 // Load all containers of this nodes under the given project.
 func containerLoadNodeProjectAll(s *state.State, project string) ([]container, error) {
 	// Get all the container arguments
-	var cts []db.Container
+	var cts []db.Instance
 	err := s.Cluster.Transaction(func(tx *db.ClusterTx) error {
 		var err error
 		cts, err = tx.ContainerNodeProjectList(project)
@@ -1458,7 +1168,7 @@ func containerLoadNodeProjectAll(s *state.State, project string) ([]container, e
 	return containerLoadAllInternal(cts, s)
 }
 
-func containerLoadAllInternal(cts []db.Container, s *state.State) ([]container, error) {
+func containerLoadAllInternal(cts []db.Instance, s *state.State) ([]container, error) {
 	// Figure out what profiles are in use
 	profiles := map[string]map[string]api.Profile{}
 	for _, cArgs := range cts {
@@ -1530,13 +1240,13 @@ func containerCompareSnapshots(source container, target container) ([]container,
 	toSync := []container{}
 
 	for _, snap := range sourceSnapshots {
-		_, snapName, _ := containerGetParentAndSnapshotName(snap.Name())
+		_, snapName, _ := shared.ContainerGetParentAndSnapshotName(snap.Name())
 
 		sourceSnapshotsTime[snapName] = snap.CreationDate()
 	}
 
 	for _, snap := range targetSnapshots {
-		_, snapName, _ := containerGetParentAndSnapshotName(snap.Name())
+		_, snapName, _ := shared.ContainerGetParentAndSnapshotName(snap.Name())
 
 		targetSnapshotsTime[snapName] = snap.CreationDate()
 		existDate, exists := sourceSnapshotsTime[snapName]
@@ -1548,7 +1258,7 @@ func containerCompareSnapshots(source container, target container) ([]container,
 	}
 
 	for _, snap := range sourceSnapshots {
-		_, snapName, _ := containerGetParentAndSnapshotName(snap.Name())
+		_, snapName, _ := shared.ContainerGetParentAndSnapshotName(snap.Name())
 
 		existDate, exists := targetSnapshotsTime[snapName]
 		if !exists || existDate != snap.CreationDate() {
@@ -1571,7 +1281,7 @@ func autoCreateContainerSnapshotsTask(d *Daemon) (task.Func, task.Schedule) {
 		// Figure out which need snapshotting (if any)
 		containers := []container{}
 		for _, c := range allContainers {
-			schedule := c.LocalConfig()["snapshots.schedule"]
+			schedule := c.ExpandedConfig()["snapshots.schedule"]
 
 			if schedule == "" {
 				continue
@@ -1585,10 +1295,18 @@ func autoCreateContainerSnapshotsTask(d *Daemon) (task.Func, task.Schedule) {
 
 			// Check if it's time to snapshot
 			now := time.Now()
+
+			// Truncate the time now back to the start of the minute, before passing to
+			// the cron scheduler, as it will add 1s to the scheduled time and we don't
+			// want the next scheduled time to roll over to the next minute and break
+			// the time comparison below.
+			now = now.Truncate(time.Minute)
+
+			// Calculate the next scheduled time based on the snapshots.schedule
+			// pattern and the time now.
 			next := sched.Next(now)
 
 			// Ignore everything that is more precise than minutes.
-			now = now.Truncate(time.Minute)
 			next = next.Truncate(time.Minute)
 
 			if !now.Equal(next) {
@@ -1596,7 +1314,7 @@ func autoCreateContainerSnapshotsTask(d *Daemon) (task.Func, task.Schedule) {
 			}
 
 			// Check if the container is running
-			if !shared.IsTrue(c.LocalConfig()["snapshots.schedule.stopped"]) && !c.IsRunning() {
+			if !shared.IsTrue(c.ExpandedConfig()["snapshots.schedule.stopped"]) && !c.IsRunning() {
 				continue
 			}
 
@@ -1656,7 +1374,7 @@ func autoCreateContainerSnapshots(ctx context.Context, d *Daemon, containers []c
 
 			snapshotName = fmt.Sprintf("%s%s%s", c.Name(), shared.SnapshotDelimiter, snapshotName)
 
-			expiry, err := shared.GetSnapshotExpiry(time.Now(), c.LocalConfig()["snapshots.expiry"])
+			expiry, err := shared.GetSnapshotExpiry(time.Now(), c.ExpandedConfig()["snapshots.expiry"])
 			if err != nil {
 				logger.Error("Error getting expiry date", log.Ctx{"err": err, "container": c})
 				ch <- nil
@@ -1777,7 +1495,7 @@ func pruneExpiredContainerSnapshots(ctx context.Context, d *Daemon, snapshots []
 func containerDetermineNextSnapshotName(d *Daemon, c container, defaultPattern string) (string, error) {
 	var err error
 
-	pattern := c.LocalConfig()["snapshots.pattern"]
+	pattern := c.ExpandedConfig()["snapshots.pattern"]
 	if pattern == "" {
 		pattern = defaultPattern
 	}
@@ -1805,7 +1523,7 @@ func containerDetermineNextSnapshotName(d *Daemon, c container, defaultPattern s
 	}
 
 	for _, snap := range snapshots {
-		_, snapOnlyName, _ := containerGetParentAndSnapshotName(snap.Name())
+		_, snapOnlyName, _ := shared.ContainerGetParentAndSnapshotName(snap.Name())
 		if snapOnlyName == pattern {
 			snapshotExists = true
 			break

@@ -14,14 +14,16 @@ import (
 	lxd "github.com/lxc/lxd/client"
 	"github.com/lxc/lxd/lxd/cluster"
 	"github.com/lxc/lxd/lxd/db"
+	driver "github.com/lxc/lxd/lxd/storage"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/logger"
 )
 
-var internalClusterContainerMovedCmd = Command{
-	name: "cluster/container-moved/{name}",
-	post: internalClusterContainerMovedPost,
+var internalClusterContainerMovedCmd = APIEndpoint{
+	Name: "cluster/container-moved/{name}",
+
+	Post: APIEndpointAction{Handler: internalClusterContainerMovedPost},
 }
 
 func containerPost(d *Daemon, r *http.Request) Response {
@@ -227,7 +229,7 @@ func containerPost(d *Daemon, r *http.Request) Response {
 	}
 
 	// Check that the name isn't already in use
-	id, _ := d.cluster.ContainerID(req.Name)
+	id, _ := d.cluster.ContainerID(project, req.Name)
 	if id > 0 {
 		return Conflict(fmt.Errorf("Name '%s' already in use", req.Name))
 	}
@@ -355,7 +357,7 @@ func containerPostClusteringMigrate(d *Daemon, c container, oldName, newName, ne
 		}
 
 		// Restore the original value of "volatile.apply_template"
-		id, err := d.cluster.ContainerID(destName)
+		id, err := d.cluster.ContainerID(c.Project(), destName)
 		if err != nil {
 			return errors.Wrap(err, "Failed to get ID of moved container")
 		}
@@ -427,13 +429,14 @@ func containerPostClusteringMigrateWithCeph(d *Daemon, c container, project, old
 		// Re-link the database entries against the new node name.
 		var poolName string
 		err := d.cluster.Transaction(func(tx *db.ClusterTx) error {
-			err := tx.ContainerNodeMove(oldName, newName, newNode)
+			err := tx.ContainerNodeMove(project, oldName, newName, newNode)
 			if err != nil {
-				return err
+				return errors.Wrapf(
+					err, "Move container %s to %s with new name %s", oldName, newNode, newName)
 			}
 			poolName, err = tx.ContainerPool(project, newName)
 			if err != nil {
-				return err
+				return errors.Wrapf(err, "Get the container's storage pool name for %s", newName)
 			}
 			return nil
 		})
@@ -527,18 +530,18 @@ func containerPostCreateContainerMountPoint(d *Daemon, project, containerName st
 		return errors.Wrap(err, "Failed to create container snapshot names")
 	}
 
-	containerMntPoint := getContainerMountPoint(c.Project(), poolName, containerName)
-	err = createContainerMountpoint(containerMntPoint, c.Path(), c.IsPrivileged())
+	containerMntPoint := driver.GetContainerMountPoint(c.Project(), poolName, containerName)
+	err = driver.CreateContainerMountpoint(containerMntPoint, c.Path(), c.IsPrivileged())
 	if err != nil {
 		return errors.Wrap(err, "Failed to create container mount point on target node")
 	}
 
 	for _, snapshotName := range snapshotNames {
-		mntPoint := getSnapshotMountPoint(project, poolName, snapshotName)
+		mntPoint := driver.GetSnapshotMountPoint(project, poolName, snapshotName)
 		snapshotsSymlinkTarget := shared.VarPath("storage-pools",
 			poolName, "containers-snapshots", containerName)
 		snapshotMntPointSymlink := shared.VarPath("snapshots", containerName)
-		err := createSnapshotMountpoint(mntPoint, snapshotsSymlinkTarget, snapshotMntPointSymlink)
+		err := driver.CreateSnapshotMountpoint(mntPoint, snapshotsSymlinkTarget, snapshotMntPointSymlink)
 		if err != nil {
 			return errors.Wrap(err, "Failed to create snapshot mount point on target node")
 		}

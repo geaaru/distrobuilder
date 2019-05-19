@@ -6,6 +6,7 @@ import (
 
 	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/lxd/db/query"
+	deviceConfig "github.com/lxc/lxd/lxd/device/config"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
 	"github.com/pkg/errors"
@@ -18,7 +19,8 @@ func doProfileUpdate(d *Daemon, project, name string, id int64, profile *api.Pro
 		return err
 	}
 
-	err = containerValidDevices(d.cluster, req.Devices, true, false)
+	// Validate container devices with an empty instanceName to indicate profile validation.
+	err = containerValidDevices(d.State(), d.cluster, "", deviceConfig.NewDevices(req.Devices), false)
 	if err != nil {
 		return err
 	}
@@ -35,7 +37,7 @@ func doProfileUpdate(d *Daemon, project, name string, id int64, profile *api.Pro
 		// Check for containers using the device
 		for _, container := range containers {
 			// Check if the device is locally overridden
-			k, v, _ := shared.GetRootDiskDevice(container.Devices)
+			k, v, _ := shared.GetRootDiskDevice(container.Devices.CloneNative())
 			if k != "" && v["pool"] != "" {
 				continue
 			}
@@ -101,7 +103,7 @@ func doProfileUpdate(d *Daemon, project, name string, id int64, profile *api.Pro
 			return err
 		}
 
-		err = db.DevicesAdd(tx, "profile", id, req.Devices)
+		err = db.DevicesAdd(tx, "profile", id, deviceConfig.NewDevices(req.Devices))
 		if err != nil {
 			tx.Rollback()
 			return err
@@ -229,18 +231,24 @@ func getProfileContainersInfo(cluster *db.Cluster, project, profile string) ([]d
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to query containers with profile '%s'", profile)
 	}
-	containers := make([]db.ContainerArgs, len(names))
-	for i, name := range names {
-		var container *db.Container
-		err := cluster.Transaction(func(tx *db.ClusterTx) error {
-			var err error
-			container, err = tx.ContainerGet(project, name)
-			return err
-		})
-		if err != nil {
-			return nil, errors.Wrapf(err, "Failed to fetch container '%s'", name)
+
+	containers := []db.ContainerArgs{}
+	err = cluster.Transaction(func(tx *db.ClusterTx) error {
+		for ctProject, ctNames := range names {
+			for _, ctName := range ctNames {
+				container, err := tx.InstanceGet(ctProject, ctName)
+				if err != nil {
+					return err
+				}
+
+				containers = append(containers, db.ContainerToArgs(container))
+			}
 		}
-		containers[i] = db.ContainerToArgs(container)
+
+		return nil
+	})
+	if err != nil {
+		return nil, errors.Wrapf(err, "Failed to fetch containers")
 	}
 
 	return containers, nil

@@ -64,10 +64,6 @@ func storagePoolVolumeTypeNameToAPIEndpoint(volumeTypeName string) (string, erro
 	return "", fmt.Errorf("invalid storage volume type name")
 }
 
-func storagePoolVolumeTypeToName(volumeType int) (string, error) {
-	return db.StoragePoolVolumeTypeToName(volumeType)
-}
-
 func storagePoolVolumeTypeToAPIEndpoint(volumeType int) (string, error) {
 	switch volumeType {
 	case storagePoolVolumeTypeContainer:
@@ -176,6 +172,23 @@ func storagePoolVolumeUpdate(state *state.State, poolName string, volumeName str
 		s.SetStoragePoolVolumeWritable(&newWritable)
 	}
 
+	// Check that security.unmapped and security.shifted aren't set together
+	if shared.IsTrue(newConfig["security.unmapped"]) && shared.IsTrue(newConfig["security.shifted"]) {
+		return fmt.Errorf("security.unmapped and security.shifted are mutually exclusive")
+	}
+
+	// Confirm that no containers are running when changing shifted state
+	if newConfig["security.shifted"] != oldConfig["security.shifted"] {
+		ctsUsingVolume, err := storagePoolVolumeUsedByRunningContainersWithProfilesGet(state, poolName, volumeName, storagePoolVolumeTypeNameCustom, true)
+		if err != nil {
+			return err
+		}
+
+		if len(ctsUsingVolume) != 0 {
+			return fmt.Errorf("Cannot modify shifting with running containers using the volume")
+		}
+	}
+
 	// Unset idmap keys if volume is unmapped
 	if shared.IsTrue(newConfig["security.unmapped"]) {
 		delete(newConfig, "volatile.idmap.last")
@@ -224,26 +237,22 @@ func storagePoolVolumeSnapshotUpdate(state *state.State, poolName string, volume
 	return nil
 }
 
-func storagePoolVolumeUsedByContainersGet(s *state.State, project, volumeName string,
-	volumeTypeName string) ([]string, error) {
+func storagePoolVolumeUsedByContainersGet(s *state.State, project, poolName string, volumeName string) ([]string, error) {
 	cts, err := containerLoadByProject(s, project)
 	if err != nil {
 		return []string{}, err
 	}
 
 	ctsUsingVolume := []string{}
-	volumeNameWithType := fmt.Sprintf("%s/%s", volumeTypeName, volumeName)
 	for _, c := range cts {
 		for _, dev := range c.LocalDevices() {
 			if dev["type"] != "disk" {
 				continue
 			}
 
-			// Make sure that we don't compare against stuff like
-			// "container////bla" but only against "container/bla".
-			cleanSource := filepath.Clean(dev["source"])
-			if cleanSource == volumeName || cleanSource == volumeNameWithType {
+			if dev["pool"] == poolName && dev["source"] == volumeName {
 				ctsUsingVolume = append(ctsUsingVolume, c.Name())
+				break
 			}
 		}
 	}
@@ -421,10 +430,10 @@ func storagePoolVolumeUsedByRunningContainersWithProfilesGet(s *state.State,
 }
 
 // volumeUsedBy = append(volumeUsedBy, fmt.Sprintf("/%s/containers/%s", version.APIVersion, ct))
-func storagePoolVolumeUsedByGet(s *state.State, project, volumeName string, volumeTypeName string) ([]string, error) {
+func storagePoolVolumeUsedByGet(s *state.State, project, poolName string, volumeName string, volumeTypeName string) ([]string, error) {
 	// Handle container volumes
 	if volumeTypeName == "container" {
-		cName, sName, snap := containerGetParentAndSnapshotName(volumeName)
+		cName, sName, snap := shared.ContainerGetParentAndSnapshotName(volumeName)
 
 		if snap {
 			return []string{fmt.Sprintf("/%s/containers/%s/snapshots/%s", version.APIVersion, cName, sName)}, nil
@@ -438,9 +447,18 @@ func storagePoolVolumeUsedByGet(s *state.State, project, volumeName string, volu
 		return []string{fmt.Sprintf("/%s/images/%s", version.APIVersion, volumeName)}, nil
 	}
 
+	// Check if the daemon itself is using it
+	used, err := daemonStorageUsed(s, poolName, volumeName)
+	if err != nil {
+		return []string{}, err
+	}
+
+	if used {
+		return []string{fmt.Sprintf("/%s", version.APIVersion)}, nil
+	}
+
 	// Look for containers using this volume
-	ctsUsingVolume, err := storagePoolVolumeUsedByContainersGet(s,
-		project, volumeName, volumeTypeName)
+	ctsUsingVolume, err := storagePoolVolumeUsedByContainersGet(s, project, poolName, volumeName)
 	if err != nil {
 		return []string{}, err
 	}
@@ -622,39 +640,13 @@ func storagePoolVolumeCreateInternal(state *state.State, poolName string, vol *a
 		err = s.StoragePoolVolumeCreate()
 	} else {
 		if !vol.Source.VolumeOnly {
-			sourcePoolID, err := state.Cluster.StoragePoolGetID(vol.Source.Pool)
-			if err != nil {
-				return err
-			}
-
 			snapshots, err := storagePoolVolumeSnapshotsGet(state, vol.Source.Pool, vol.Source.Name, volumeType)
 			if err != nil {
 				return err
 			}
 
 			for _, snap := range snapshots {
-				_, snapOnlyName, _ := containerGetParentAndSnapshotName(snap)
-
-				volumeID, err := state.Cluster.StoragePoolNodeVolumeGetTypeID(snap, volumeType, sourcePoolID)
-				if err != nil {
-					return err
-				}
-
-				volumeDescription, err := state.Cluster.StorageVolumeDescriptionGet(volumeID)
-				if err != nil {
-					return err
-				}
-
-				dbArgs := &db.StorageVolumeArgs{
-					Name:        fmt.Sprintf("%s/%s", vol.Name, snapOnlyName),
-					PoolName:    poolName,
-					TypeName:    vol.Type,
-					Snapshot:    true,
-					Config:      vol.Config,
-					Description: volumeDescription,
-				}
-
-				_, err = storagePoolVolumeSnapshotDBCreateInternal(state, dbArgs)
+				_, err := storagePoolVolumeSnapshotCopyInternal(state, poolName, vol, shared.ExtractSnapshotName(snap))
 				if err != nil {
 					return err
 				}
@@ -670,6 +662,41 @@ func storagePoolVolumeCreateInternal(state *state.State, poolName string, vol *a
 	revert = false
 
 	return nil
+}
+
+func storagePoolVolumeSnapshotCopyInternal(state *state.State, poolName string, vol *api.StorageVolumesPost, snapshotName string) (storage, error) {
+	volumeType, err := storagePoolVolumeTypeNameToType(vol.Type)
+	if err != nil {
+		return nil, err
+	}
+
+	fullSnapshotName := fmt.Sprintf("%s/%s", vol.Name, snapshotName)
+
+	sourcePoolID, err := state.Cluster.StoragePoolGetID(vol.Source.Pool)
+	if err != nil {
+		return nil, err
+	}
+
+	volumeID, err := state.Cluster.StoragePoolNodeVolumeGetTypeID(vol.Source.Name, volumeType, sourcePoolID)
+	if err != nil {
+		return nil, err
+	}
+
+	volumeDescription, err := state.Cluster.StorageVolumeDescriptionGet(volumeID)
+	if err != nil {
+		return nil, err
+	}
+
+	dbArgs := &db.StorageVolumeArgs{
+		Name:        fullSnapshotName,
+		PoolName:    poolName,
+		TypeName:    vol.Type,
+		Snapshot:    true,
+		Config:      vol.Config,
+		Description: volumeDescription,
+	}
+
+	return storagePoolVolumeSnapshotDBCreateInternal(state, dbArgs)
 }
 
 func storagePoolVolumeSnapshotDBCreateInternal(state *state.State, dbArgs *db.StorageVolumeArgs) (storage, error) {

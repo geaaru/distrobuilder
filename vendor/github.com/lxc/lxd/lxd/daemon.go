@@ -2,9 +2,10 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/x509"
 	"database/sql"
-	"database/sql/driver"
+	sqldriver "database/sql/driver"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,14 +14,15 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/CanonicalLtd/candidclient"
-	"github.com/CanonicalLtd/go-dqlite"
+	"github.com/canonical/go-dqlite/driver"
 	"github.com/gorilla/mux"
 	"github.com/pkg/errors"
-	"golang.org/x/net/context"
+	"golang.org/x/sys/unix"
+	lxc "gopkg.in/lxc/go-lxc.v2"
+
 	"gopkg.in/macaroon-bakery.v2/bakery"
 	"gopkg.in/macaroon-bakery.v2/bakery/checkers"
 	"gopkg.in/macaroon-bakery.v2/bakery/identchecker"
@@ -28,9 +30,11 @@ import (
 
 	"github.com/lxc/lxd/lxd/cluster"
 	"github.com/lxc/lxd/lxd/db"
+	"github.com/lxc/lxd/lxd/device"
 	"github.com/lxc/lxd/lxd/endpoints"
 	"github.com/lxc/lxd/lxd/maas"
 	"github.com/lxc/lxd/lxd/node"
+	"github.com/lxc/lxd/lxd/rbac"
 	"github.com/lxc/lxd/lxd/state"
 	"github.com/lxc/lxd/lxd/sys"
 	"github.com/lxc/lxd/lxd/task"
@@ -49,6 +53,7 @@ type Daemon struct {
 	os           *sys.OS
 	db           *db.Node
 	maas         *maas.Controller
+	rbac         *rbac.Server
 	cluster      *db.Cluster
 	setupChan    chan struct{} // Closed when basic Daemon setup is completed
 	readyChan    chan struct{} // Closed when LXD is fully ready
@@ -66,10 +71,14 @@ type Daemon struct {
 	config    *DaemonConfig
 	endpoints *endpoints.Endpoints
 	gateway   *cluster.Gateway
+	seccomp   *SeccompServer
 
 	proxy func(req *http.Request) (*url.URL, error)
 
 	externalAuth *externalAuth
+
+	// Stores last heartbeat node information to detect node changes.
+	lastNodeList *cluster.APIHeartbeat
 }
 
 type externalAuth struct {
@@ -144,21 +153,51 @@ func DefaultDaemon() *Daemon {
 	return NewDaemon(config, os)
 }
 
-// Command is the basic structure for every API call.
-type Command struct {
-	name          string
-	untrustedGet  bool
-	untrustedPost bool
-	get           func(d *Daemon, r *http.Request) Response
-	put           func(d *Daemon, r *http.Request) Response
-	post          func(d *Daemon, r *http.Request) Response
-	delete        func(d *Daemon, r *http.Request) Response
-	patch         func(d *Daemon, r *http.Request) Response
+// APIEndpoint represents a URL in our API.
+type APIEndpoint struct {
+	Name   string
+	Get    APIEndpointAction
+	Put    APIEndpointAction
+	Post   APIEndpointAction
+	Delete APIEndpointAction
+	Patch  APIEndpointAction
+}
+
+// APIEndpointAction represents an action on an API endpoint.
+type APIEndpointAction struct {
+	Handler        func(d *Daemon, r *http.Request) Response
+	AccessHandler  func(d *Daemon, r *http.Request) Response
+	AllowUntrusted bool
+}
+
+// AllowAuthenticated is a AccessHandler which allows all requests
+func AllowAuthenticated(d *Daemon, r *http.Request) Response {
+	return EmptySyncResponse
+}
+
+// AllowProjectPermission is a wrapper to check access against the project, its features and RBAC permission
+func AllowProjectPermission(feature string, permission string) func(d *Daemon, r *http.Request) Response {
+	return func(d *Daemon, r *http.Request) Response {
+		// Shortcut for speed
+		if d.userIsAdmin(r) {
+			return EmptySyncResponse
+		}
+
+		// Get the project
+		project := projectParam(r)
+
+		// Validate whether the user has the needed permission
+		if !d.userHasPermission(r, project, permission) {
+			return Forbidden(nil)
+		}
+
+		return EmptySyncResponse
+	}
 }
 
 // Convenience function around Authenticate
 func (d *Daemon) checkTrustedClient(r *http.Request) error {
-	trusted, _, err := d.Authenticate(r)
+	trusted, _, _, err := d.Authenticate(r)
 	if !trusted || err != nil {
 		if err != nil {
 			return err
@@ -175,7 +214,7 @@ func (d *Daemon) checkTrustedClient(r *http.Request) error {
 // will validate the TLS certificate or Macaroon.
 //
 // This does not perform authorization, only validates authentication
-func (d *Daemon) Authenticate(r *http.Request) (bool, string, error) {
+func (d *Daemon) Authenticate(r *http.Request) (bool, string, string, error) {
 	// Allow internal cluster traffic
 	if r.TLS != nil {
 		cert, _ := x509.ParseCertificate(d.endpoints.NetworkCert().KeyPair().Certificate[0])
@@ -183,29 +222,29 @@ func (d *Daemon) Authenticate(r *http.Request) (bool, string, error) {
 		for i := range r.TLS.PeerCertificates {
 			trusted, _ := util.CheckTrustState(*r.TLS.PeerCertificates[i], clusterCerts)
 			if trusted {
-				return true, "", nil
+				return true, "", "cluster", nil
 			}
 		}
 	}
 
 	// Local unix socket queries
 	if r.RemoteAddr == "@" {
-		return true, "", nil
+		return true, "", "unix", nil
 	}
 
 	// Devlxd unix socket credentials on main API
 	if r.RemoteAddr == "@devlxd" {
-		return false, "", fmt.Errorf("Main API query can't come from /dev/lxd socket")
+		return false, "", "", fmt.Errorf("Main API query can't come from /dev/lxd socket")
 	}
 
 	// Cluster notification with wrong certificate
 	if isClusterNotification(r) {
-		return false, "", fmt.Errorf("Cluster notification isn't using cluster certificate")
+		return false, "", "", fmt.Errorf("Cluster notification isn't using cluster certificate")
 	}
 
 	// Bad query, no TLS found
 	if r.TLS == nil {
-		return false, "", fmt.Errorf("Bad/missing TLS on network query")
+		return false, "", "", fmt.Errorf("Bad/missing TLS on network query")
 	}
 
 	if d.externalAuth != nil && r.Header.Get(httpbakery.BakeryProtocolHeader) != "" {
@@ -221,28 +260,28 @@ func (d *Daemon) Authenticate(r *http.Request) (bool, string, error) {
 		info, err := authChecker.Allow(ctx, ops...)
 		if err != nil {
 			// Bad macaroon
-			return false, "", err
+			return false, "", "", err
 		}
 
 		if info != nil && info.Identity != nil {
 			// Valid identity macaroon found
-			return true, info.Identity.Id(), nil
+			return true, info.Identity.Id(), "candid", nil
 		}
 
 		// Valid macaroon with no identity information
-		return true, "", nil
+		return true, "", "candid", nil
 	}
 
 	// Validate normal TLS access
 	for i := range r.TLS.PeerCertificates {
 		trusted, username := util.CheckTrustState(*r.TLS.PeerCertificates[i], d.clientCerts)
 		if trusted {
-			return true, username, nil
+			return true, username, "tls", nil
 		}
 	}
 
 	// Reject unauthorized
-	return false, "", nil
+	return false, "", "", nil
 }
 
 func writeMacaroonsRequiredResponse(b *identchecker.Bakery, r *http.Request, w http.ResponseWriter, derr *bakery.DischargeRequiredError, expiry int64) {
@@ -297,12 +336,12 @@ func (d *Daemon) UnixSocket() string {
 	return filepath.Join(d.os.VarDir, "unix.socket")
 }
 
-func (d *Daemon) createCmd(restAPI *mux.Router, version string, c Command) {
+func (d *Daemon) createCmd(restAPI *mux.Router, version string, c APIEndpoint) {
 	var uri string
-	if c.name == "" {
+	if c.Name == "" {
 		uri = fmt.Sprintf("/%s", version)
 	} else {
-		uri = fmt.Sprintf("/%s/%s", version, c.name)
+		uri = fmt.Sprintf("/%s/%s", version, c.Name)
 	}
 
 	restAPI.HandleFunc(uri, func(w http.ResponseWriter, r *http.Request) {
@@ -319,7 +358,7 @@ func (d *Daemon) createCmd(restAPI *mux.Router, version string, c Command) {
 		}
 
 		// Authentication
-		trusted, username, err := d.Authenticate(r)
+		trusted, username, protocol, err := d.Authenticate(r)
 		if err != nil {
 			// If not a macaroon discharge request, return the error
 			_, ok := err.(*bakery.DischargeRequiredError)
@@ -329,7 +368,17 @@ func (d *Daemon) createCmd(restAPI *mux.Router, version string, c Command) {
 			}
 		}
 
-		untrustedOk := (r.Method == "GET" && c.untrustedGet) || (r.Method == "POST" && c.untrustedPost)
+		// Reject internal queries to remote, non-cluster, clients
+		if version == "internal" && !shared.StringInSlice(protocol, []string{"unix", "cluster"}) {
+			// Except for the initial cluster accept request (done over trusted TLS)
+			if !trusted || c.Name != "cluster/accept" || protocol != "tls" {
+				logger.Warn("Rejecting remote internal API request", log.Ctx{"ip": r.RemoteAddr})
+				Forbidden(nil).Render(w)
+				return
+			}
+		}
+
+		untrustedOk := (r.Method == "GET" && c.Get.AllowUntrusted) || (r.Method == "POST" && c.Post.AllowUntrusted)
 		if trusted {
 			logger.Debug("Handling", log.Ctx{"method": r.Method, "url": r.URL.RequestURI(), "ip": r.RemoteAddr, "user": username})
 			r = r.WithContext(context.WithValue(r.Context(), "username", username))
@@ -362,27 +411,38 @@ func (d *Daemon) createCmd(restAPI *mux.Router, version string, c Command) {
 		var resp Response
 		resp = NotImplemented(nil)
 
+		handleRequest := func(action APIEndpointAction) Response {
+			if action.Handler == nil {
+				return NotImplemented(nil)
+			}
+
+			if action.AccessHandler != nil {
+				// Defer access control to custom handler
+				resp := action.AccessHandler(d, r)
+				if resp != EmptySyncResponse {
+					return resp
+				}
+			} else if !action.AllowUntrusted {
+				// Require admin privileges
+				if !d.userIsAdmin(r) {
+					return Forbidden(nil)
+				}
+			}
+
+			return action.Handler(d, r)
+		}
+
 		switch r.Method {
 		case "GET":
-			if c.get != nil {
-				resp = c.get(d, r)
-			}
+			resp = handleRequest(c.Get)
 		case "PUT":
-			if c.put != nil {
-				resp = c.put(d, r)
-			}
+			resp = handleRequest(c.Put)
 		case "POST":
-			if c.post != nil {
-				resp = c.post(d, r)
-			}
+			resp = handleRequest(c.Post)
 		case "DELETE":
-			if c.delete != nil {
-				resp = c.delete(d, r)
-			}
+			resp = handleRequest(c.Delete)
 		case "PATCH":
-			if c.patch != nil {
-				resp = c.patch(d, r)
-			}
+			resp = handleRequest(c.Patch)
 		default:
 			resp = NotFound(fmt.Errorf("Method '%s' not found", r.Method))
 		}
@@ -419,13 +479,13 @@ func setupSharedMounts() error {
 	}
 
 	// Mount a new tmpfs
-	if err := syscall.Mount("tmpfs", path, "tmpfs", 0, "size=100k,mode=0711"); err != nil {
+	if err := unix.Mount("tmpfs", path, "tmpfs", 0, "size=100k,mode=0711"); err != nil {
 		return err
 	}
 
 	// Mark as MS_SHARED and MS_REC
-	var flags uintptr = syscall.MS_SHARED | syscall.MS_REC
-	if err := syscall.Mount(path, path, "none", flags, ""); err != nil {
+	var flags uintptr = unix.MS_SHARED | unix.MS_REC
+	if err := unix.Mount(path, path, "none", flags, ""); err != nil {
 		return err
 	}
 
@@ -494,6 +554,13 @@ func (d *Daemon) init() error {
 		logger.Infof(" - uevent injection: no")
 	}
 
+	d.os.SeccompListener = CanUseSeccompListener()
+	if d.os.SeccompListener {
+		logger.Infof(" - seccomp listener: yes")
+	} else {
+		logger.Infof(" - seccomp listener: no")
+	}
+
 	/*
 	 * During daemon startup we're the only thread that touches VFS3Fscaps
 	 * so we don't need to bother with atomic.StoreInt32() when touching
@@ -515,6 +582,20 @@ func (d *Daemon) init() error {
 		logger.Infof(" - shiftfs support: no")
 	}
 
+	// Detect LXC features
+	d.os.LXCFeatures = map[string]bool{}
+	lxcExtensions := []string{
+		"mount_injection_file",
+		"seccomp_notify",
+		"network_ipvlan",
+		"network_l2proxy",
+		"network_gateway_device_route",
+		"network_phys_macvlan_mtu",
+	}
+	for _, extension := range lxcExtensions {
+		d.os.LXCFeatures[extension] = lxc.HasApiExtension(extension)
+	}
+
 	/* Initialize the database */
 	dump, err := initializeDbObject(d)
 	if err != nil {
@@ -525,34 +606,6 @@ func (d *Daemon) init() error {
 	certInfo, err := util.LoadCert(d.os.VarDir)
 	if err != nil {
 		return err
-	}
-
-	clustered, err := cluster.Enabled(d.db)
-	if err != nil {
-		return err
-	}
-
-	// If not already applied, run the daemon patch that shrinks the boltdb
-	// file. We can't run this daemon patch later on along with the other
-	// ones because it needs to run before we open the cluster database.
-	appliedPatches, err := d.db.Patches()
-	if err != nil {
-		return errors.Wrap(err, "Fetch applied daemon patches")
-	}
-	if !shared.StringInSlice("shrink_logs_db_file", appliedPatches) {
-		if !clustered {
-			// We actually run the patch only if this lxd daemon is
-			// not clustered.
-			err := patchShrinkLogsDBFile("", d)
-			if err != nil {
-				return errors.Wrap(err, "Shrink logs.db file")
-			}
-		}
-
-		err = d.db.PatchesMarkApplied("shrink_logs_db_file")
-		if err != nil {
-			return err
-		}
 	}
 
 	/* Setup dqlite */
@@ -568,6 +621,7 @@ func (d *Daemon) init() error {
 	if err != nil {
 		return err
 	}
+	d.gateway.HeartbeatNodeHook = d.NodeRefreshTask
 
 	/* Setup some mounts (nice to have) */
 	if !d.os.MockMode {
@@ -577,7 +631,7 @@ func (d *Daemon) init() error {
 		// Attempt to Mount the devlxd tmpfs
 		devlxd := filepath.Join(d.os.VarDir, "devlxd")
 		if !shared.IsMountPoint(devlxd) {
-			syscall.Mount("tmpfs", devlxd, "tmpfs", 0, "size=100k,mode=0755")
+			unix.Mount("tmpfs", devlxd, "tmpfs", 0, "size=100k,mode=0755")
 		}
 	}
 
@@ -613,11 +667,17 @@ func (d *Daemon) init() error {
 		return err
 	}
 
+	clustered, err := cluster.Enabled(d.db)
+	if err != nil {
+		return err
+	}
+
 	/* Open the cluster database */
 	for {
 		logger.Info("Initializing global database")
 		dir := filepath.Join(d.os.VarDir, "database")
-		store := d.gateway.ServerStore()
+
+		store := d.gateway.NodeStore()
 
 		contextTimeout := 5 * time.Second
 		if !clustered {
@@ -629,12 +689,12 @@ func (d *Daemon) init() error {
 
 		d.cluster, err = db.OpenCluster(
 			"db.bin", store, clusterAddress, dir,
-			d.config.DqliteSetupTimeout,
-			dqlite.WithDialFunc(d.gateway.DialFunc()),
-			dqlite.WithContext(d.gateway.Context()),
-			dqlite.WithConnectionTimeout(10*time.Second),
-			dqlite.WithContextTimeout(contextTimeout),
-			dqlite.WithLogFunc(cluster.DqliteLog),
+			d.config.DqliteSetupTimeout, dump,
+			driver.WithDialFunc(d.gateway.DialFunc()),
+			driver.WithContext(d.gateway.Context()),
+			driver.WithConnectionTimeout(10*time.Second),
+			driver.WithContextTimeout(contextTimeout),
+			driver.WithLogFunc(cluster.DqliteLog),
 		)
 		if err == nil {
 			break
@@ -649,7 +709,7 @@ func (d *Daemon) init() error {
 			// The only thing we want to still do on this node is
 			// to run the heartbeat task, in case we are the raft
 			// leader.
-			stop, _ := task.Start(cluster.Heartbeat(d.gateway, d.cluster))
+			stop, _ := task.Start(cluster.HeartbeatTask(d.gateway))
 			d.gateway.WaitUpgradeNotification()
 			stop(time.Second)
 
@@ -659,6 +719,7 @@ func (d *Daemon) init() error {
 		}
 		return errors.Wrap(err, "failed to open cluster database")
 	}
+
 	err = cluster.NotifyUpgradeCompleted(d.State(), certInfo)
 	if err != nil {
 		// Ignore the error, since it's not fatal for this particular
@@ -666,28 +727,20 @@ func (d *Daemon) init() error {
 		// offline.
 		logger.Debugf("Could not notify all nodes of database upgrade: %v", err)
 	}
+	d.gateway.Cluster = d.cluster
 
-	/* Migrate the node local data to the cluster database, if needed */
-	if dump != nil {
-		logger.Infof("Migrating data from local to global database")
-		err = d.cluster.ImportPreClusteringData(dump)
+	// This logic used to belong to patchUpdateFromV10, but has been moved
+	// here because it needs database access.
+	if shared.PathExists(shared.VarPath("lxc")) {
+		err := os.Rename(shared.VarPath("lxc"), shared.VarPath("containers"))
 		if err != nil {
-			// Restore the local sqlite3 backup and wipe the raft
-			// directory, so users can fix problems and retry.
-			path := d.os.LocalDatabasePath()
-			copyErr := shared.FileCopy(path+".bak", path)
-			if copyErr != nil {
-				// Ignore errors here, there's not much we can do
-				logger.Errorf("Failed to restore local database: %v", copyErr)
-			}
-			rmErr := os.RemoveAll(d.os.GlobalDatabaseDir())
-			if rmErr != nil {
-				// Ignore errors here, there's not much we can do
-				logger.Errorf("Failed to cleanup global database: %v", rmErr)
-			}
-
-			return fmt.Errorf("Failed to migrate data to global database: %v", err)
+			return err
 		}
+
+		logger.Debugf("Restarting all the containers following directory rename")
+		s := d.State()
+		containersShutdown(s)
+		containersRestart(s)
 	}
 
 	// Setup the user-agent
@@ -698,6 +751,12 @@ func (d *Daemon) init() error {
 	/* Read the storage pools */
 	logger.Infof("Initializing storage pools")
 	err = SetupStorageDriver(d.State(), false)
+	if err != nil {
+		return err
+	}
+
+	// Mount any daemon storage
+	err = daemonStorageMount(d.State())
 	if err != nil {
 		return err
 	}
@@ -719,10 +778,19 @@ func (d *Daemon) init() error {
 	pruneLeftoverImages(d)
 
 	/* Setup the proxy handler, external authentication and MAAS */
-	var candidExpiry int64
+	candidAPIURL := ""
+	candidAPIKey := ""
 	candidDomains := ""
-	candidEndpoint := ""
-	candidEndpointKey := ""
+	candidExpiry := int64(0)
+
+	rbacAPIURL := ""
+	rbacAPIKey := ""
+	rbacAgentURL := ""
+	rbacAgentUsername := ""
+	rbacAgentPrivateKey := ""
+	rbacAgentPublicKey := ""
+	rbacExpiry := int64(0)
+
 	maasAPIURL := ""
 	maasAPIKey := ""
 	maasMachine := ""
@@ -750,20 +818,29 @@ func (d *Daemon) init() error {
 		d.proxy = shared.ProxyFromConfig(
 			config.ProxyHTTPS(), config.ProxyHTTP(), config.ProxyIgnoreHosts(),
 		)
-		candidEndpoint = config.CandidEndpoint()
-		candidEndpointKey = config.CandidEndpointKey()
-		candidExpiry = config.CandidExpiry()
-		candidDomains = config.CandidDomains()
+
+		candidAPIURL, candidAPIKey, candidExpiry, candidDomains = config.CandidServer()
 		maasAPIURL, maasAPIKey = config.MAASController()
+		rbacAPIURL, rbacAPIKey, rbacExpiry, rbacAgentURL, rbacAgentUsername, rbacAgentPrivateKey, rbacAgentPublicKey = config.RBACServer()
+
 		return nil
 	})
 	if err != nil {
 		return err
 	}
 
-	err = d.setupExternalAuthentication(candidEndpoint, candidEndpointKey, candidExpiry, candidDomains)
-	if err != nil {
-		return err
+	if rbacAPIURL != "" {
+		err = d.setupRBACServer(rbacAPIURL, rbacAPIKey, rbacExpiry, rbacAgentURL, rbacAgentUsername, rbacAgentPrivateKey, rbacAgentPublicKey)
+		if err != nil {
+			return err
+		}
+	}
+
+	if candidAPIURL != "" {
+		err = d.setupExternalAuthentication(candidAPIURL, candidAPIKey, candidExpiry, candidDomains)
+		if err != nil {
+			return err
+		}
 	}
 
 	if !d.os.MockMode {
@@ -771,13 +848,26 @@ func (d *Daemon) init() error {
 		go deviceEventListener(d.State())
 
 		// Setup inotify watches
-		_, err := deviceInotifyInit(d.State())
+		_, err := device.InotifyInit(d.State())
 		if err != nil {
 			return err
 		}
 
-		deviceInotifyDirRescan(d.State())
-		go deviceInotifyHandler(d.State())
+		go device.InotifyHandler(d.State())
+
+		// Register devices on running instances to receive events.
+		// This should come after the event handler go routines have been started.
+		devicesRegister(d.State())
+
+		// Setup seccomp handler
+		if d.os.SeccompListener {
+			seccompServer, err := NewSeccompServer(d, shared.VarPath("seccomp.socket"))
+			if err != nil {
+				return err
+			}
+			d.seccomp = seccompServer
+			logger.Info("Started seccomp handler", log.Ctx{"path": shared.VarPath("seccomp.socket")})
+		}
 
 		// Read the trusted certificates
 		readSavedClientCAList(d)
@@ -812,13 +902,10 @@ func (d *Daemon) init() error {
 
 func (d *Daemon) startClusterTasks() {
 	// Heartbeats
-	d.clusterTasks.Add(cluster.Heartbeat(d.gateway, d.cluster))
+	d.clusterTasks.Add(cluster.HeartbeatTask(d.gateway))
 
 	// Events
 	d.clusterTasks.Add(cluster.Events(d.endpoints, d.cluster, eventForward))
-
-	// Cluster update trigger
-	d.clusterTasks.Add(cluster.KeepUpdated(d.State()))
 
 	// Auto-sync images across the cluster (daily)
 	d.clusterTasks.Add(autoSyncImagesTask(d))
@@ -955,7 +1042,7 @@ func (d *Daemon) Stop() error {
 		// If we got io.EOF the network connection was interrupted and
 		// it's likely that the other node shutdown. Let's just log the
 		// event and return cleanly.
-		if errors.Cause(err) == driver.ErrBadConn {
+		if errors.Cause(err) == sqldriver.ErrBadConn {
 			logger.Debugf("Could not close remote database cleanly: %v", err)
 		} else {
 			trackError(err)
@@ -979,8 +1066,8 @@ func (d *Daemon) Stop() error {
 	if shouldUnmount {
 		logger.Infof("Unmounting temporary filesystems")
 
-		syscall.Unmount(shared.VarPath("devlxd"), syscall.MNT_DETACH)
-		syscall.Unmount(shared.VarPath("shmounts"), syscall.MNT_DETACH)
+		unix.Unmount(shared.VarPath("devlxd"), unix.MNT_DETACH)
+		unix.Unmount(shared.VarPath("shmounts"), unix.MNT_DETACH)
 
 		logger.Infof("Done unmounting temporary filesystems")
 	} else {
@@ -1085,6 +1172,65 @@ func (d *Daemon) setupExternalAuthentication(authEndpoint string, authPubkey str
 	return nil
 }
 
+// Setup RBAC
+func (d *Daemon) setupRBACServer(rbacURL string, rbacKey string, rbacExpiry int64, rbacAgentURL string, rbacAgentUsername string, rbacAgentPrivateKey string, rbacAgentPublicKey string) error {
+	if d.rbac != nil || rbacURL == "" || rbacAgentURL == "" || rbacAgentUsername == "" || rbacAgentPrivateKey == "" || rbacAgentPublicKey == "" {
+		return nil
+	}
+
+	// Get a new server struct
+	server, err := rbac.NewServer(rbacURL, rbacKey, rbacAgentURL, rbacAgentUsername, rbacAgentPrivateKey, rbacAgentPublicKey)
+	if err != nil {
+		return err
+	}
+
+	// Set projects helper
+	server.ProjectsFunc = func() (map[int64]string, error) {
+		var result map[int64]string
+		err := d.cluster.Transaction(func(tx *db.ClusterTx) error {
+			var err error
+			result, err = tx.ProjectMap()
+			return err
+		})
+
+		return result, err
+	}
+
+	// Perform full sync
+	err = server.SyncProjects()
+	if err != nil {
+		return err
+	}
+
+	server.StartStatusCheck()
+
+	d.rbac = server
+
+	// Enable candid authentication
+	err = d.setupExternalAuthentication(fmt.Sprintf("%s/auth", rbacURL), rbacKey, rbacExpiry, "")
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (d *Daemon) userIsAdmin(r *http.Request) bool {
+	if d.externalAuth == nil || d.rbac == nil || r.RemoteAddr == "@" {
+		return true
+	}
+
+	return d.rbac.IsAdmin(r.Context().Value("username").(string))
+}
+
+func (d *Daemon) userHasPermission(r *http.Request, project string, permission string) bool {
+	if d.externalAuth == nil || d.rbac == nil || r.RemoteAddr == "@" {
+		return true
+	}
+
+	return d.rbac.HasPermission(r.Context().Value("username").(string), project, permission)
+}
+
 // Setup MAAS
 func (d *Daemon) setupMAASController(server string, key string, machine string) error {
 	var err error
@@ -1137,22 +1283,10 @@ func initializeDbObject(d *Daemon) (*db.Dump, error) {
 	legacy := map[int]*db.LegacyPatch{}
 	for i, patch := range legacyPatches {
 		legacy[i] = &db.LegacyPatch{
-			Hook: func(node *sql.DB) error {
-				// FIXME: Use the low-level *node* SQL db as backend for both the
-				//        db.Node and db.Cluster objects, since at this point we
-				//        haven't migrated the data to the cluster database yet.
-				cluster := d.cluster
-				defer func() {
-					d.cluster = cluster
-				}()
-				d.db = db.ForLegacyPatches(node)
-				d.cluster = db.ForLocalInspection(node)
-				return patch(d)
+			Hook: func(tx *sql.Tx) error {
+				return patch(tx)
 			},
 		}
-	}
-	for _, i := range legacyPatchesNeedingDB {
-		legacy[i].NeedsDB = true
 	}
 
 	// Hook to run when the local database is created from scratch. It will
@@ -1174,4 +1308,63 @@ func initializeDbObject(d *Daemon) (*db.Dump, error) {
 	}
 
 	return dump, nil
+}
+
+func (d *Daemon) hasNodeListChanged(heartbeatData *cluster.APIHeartbeat) bool {
+	// No previous heartbeat data.
+	if d.lastNodeList == nil {
+		return true
+	}
+
+	// Member count has changed.
+	if len(d.lastNodeList.Members) != len(heartbeatData.Members) {
+		return true
+	}
+
+	// Check for node address changes.
+	for lastMemberID, lastMember := range d.lastNodeList.Members {
+		if heartbeatData.Members[lastMemberID].Address != lastMember.Address {
+			return true
+		}
+	}
+
+	return false
+}
+
+// NodeRefreshTask is run each time a fresh node is generated.
+// This can be used to trigger actions when the node list changes.
+func (d *Daemon) NodeRefreshTask(heartbeatData *cluster.APIHeartbeat) {
+	// If the max version of the cluster has changed, check whether we need to upgrade.
+	if d.lastNodeList == nil || d.lastNodeList.Version.APIExtensions != heartbeatData.Version.APIExtensions || d.lastNodeList.Version.Schema != heartbeatData.Version.Schema {
+		err := cluster.MaybeUpdate(d.State())
+		if err != nil {
+			logger.Errorf("Error updating: %v", err)
+			return
+		}
+	}
+
+	// Only refresh forkdns peers if the full state list has been generated.
+	if heartbeatData.FullStateList && len(heartbeatData.Members) > 0 {
+		for i, node := range heartbeatData.Members {
+			// Exclude nodes that the leader considers offline.
+			// This is to avoid forkdns delaying results by querying an offline node.
+			if !node.Online {
+				logger.Warnf("Excluding offline node from refresh: %+v", node)
+				delete(heartbeatData.Members, i)
+			}
+		}
+
+		nodeListChanged := d.hasNodeListChanged(heartbeatData)
+		if nodeListChanged {
+			err := networkUpdateForkdnsServersTask(d.State(), heartbeatData)
+			if err != nil {
+				logger.Errorf("Error refreshing forkdns: %v", err)
+				return
+			}
+		}
+	}
+
+	// Only update the node list if the task succeeded.
+	// If it fails then it will get to run again next heartbeat.
+	d.lastNodeList = heartbeatData
 }

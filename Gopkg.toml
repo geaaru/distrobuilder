@@ -27,15 +27,15 @@
 
 [[constraint]]
   branch = "master"
+  name = "github.com/mudler/docker-companion"
+
+[[constraint]]
+  version = "lxd-3.12"
   name = "github.com/lxc/lxd"
 
 [[constraint]]
-  name = "github.com/mudler/docker-companion"
-  version = "0.4.5"
-
-[[constraint]]
   name = "github.com/spf13/cobra"
-  version = "0.0.3"
+  version = "0.0.4"
 
 [[constraint]]
   name = "github.com/stretchr/testify"
@@ -53,19 +53,27 @@
   name = "gopkg.in/yaml.v2"
   version = "2.2.2"
 
+[[override]]
+  name = "github.com/opencontainers/runtime-tools"
+  revision = "095789df6c2bc53a9dd4464cda8c22616d66e0d6"
+
+[[override]]
+  revision = "5b71a03e2700cbb1091b78849b8748f5e1692650"
+  name = "github.com/opencontainers/runtime-spec"
+
+[[override]]
+  name = "github.com/openSUSE/umoci"
+  version = "v0.4.4"
+
 [prune]
   go-tests = true
   unused-packages = true
 
-[[prune.project]]
-name = "github.com/lxc/lxd"
-unused-packages = false
+  [[prune.project]]
+    name = "github.com/openSUSE/umoci"
+    non-go = true
 
-[[constraint]]
-  name = "github.com/opencontainers/runtime-spec"
-  version = "1.0.1"
-
-[[override]]
-  name = "github.com/opencontainers/runtime-tools"
-  version = "0.8.0"
+  [[prune.project]]
+    name = "github.com/lxc/lxd"
+    unused-packages = false
 

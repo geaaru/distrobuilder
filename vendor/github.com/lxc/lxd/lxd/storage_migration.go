@@ -7,18 +7,18 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/lxc/lxd/lxd/db"
+	deviceConfig "github.com/lxc/lxd/lxd/device/config"
 	"github.com/lxc/lxd/lxd/migration"
-	"github.com/lxc/lxd/lxd/types"
+	"github.com/lxc/lxd/lxd/project"
+	driver "github.com/lxc/lxd/lxd/storage"
 	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/logger"
 )
 
 // MigrationStorageSourceDriver defines the functions needed to implement a
 // migration source driver.
 type MigrationStorageSourceDriver interface {
-	/* snapshots for this container, if any */
-	Snapshots() []container
-
 	/* send any bits of the container/snapshots that are possible while the
 	 * container is still running.
 	 */
@@ -36,7 +36,7 @@ type MigrationStorageSourceDriver interface {
 	 */
 	Cleanup()
 
-	SendStorageVolume(conn *websocket.Conn, op *operation, bwlimit string, storage storage) error
+	SendStorageVolume(conn *websocket.Conn, op *operation, bwlimit string, storage storage, volumeOnly bool) error
 }
 
 type rsyncStorageSourceDriver struct {
@@ -45,11 +45,7 @@ type rsyncStorageSourceDriver struct {
 	rsyncFeatures []string
 }
 
-func (s rsyncStorageSourceDriver) Snapshots() []container {
-	return s.snapshots
-}
-
-func (s rsyncStorageSourceDriver) SendStorageVolume(conn *websocket.Conn, op *operation, bwlimit string, storage storage) error {
+func (s rsyncStorageSourceDriver) SendStorageVolume(conn *websocket.Conn, op *operation, bwlimit string, storage storage, volumeOnly bool) error {
 	ourMount, err := storage.StoragePoolVolumeMount()
 	if err != nil {
 		return err
@@ -58,19 +54,43 @@ func (s rsyncStorageSourceDriver) SendStorageVolume(conn *websocket.Conn, op *op
 		defer storage.StoragePoolVolumeUmount()
 	}
 
+	state := storage.GetState()
 	pool := storage.GetStoragePool()
 	volume := storage.GetStoragePoolVolume()
 
+	if !volumeOnly {
+		snapshots, err := storagePoolVolumeSnapshotsGet(state, pool.Name, volume.Name, storagePoolVolumeTypeCustom)
+		if err != nil {
+			return err
+		}
+
+		for _, snap := range snapshots {
+			wrapper := StorageProgressReader(op, "fs_progress", snap)
+			path := driver.GetStoragePoolVolumeSnapshotMountPoint(pool.Name, snap)
+			path = shared.AddSlash(path)
+			logger.Debugf("Starting to send storage volume snapshot %s on storage pool %s from %s", snap, pool.Name, path)
+
+			err = RsyncSend(volume.Name, path, conn, wrapper, s.rsyncFeatures, bwlimit, state.OS.ExecPath)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
 	wrapper := StorageProgressReader(op, "fs_progress", volume.Name)
-	state := storage.GetState()
-	path := getStoragePoolVolumeMountPoint(pool.Name, volume.Name)
+	path := driver.GetStoragePoolVolumeMountPoint(pool.Name, volume.Name)
 	path = shared.AddSlash(path)
 	logger.Debugf("Starting to send storage volume %s on storage pool %s from %s", volume.Name, pool.Name, path)
-	return RsyncSend(volume.Name, path, conn, wrapper, s.rsyncFeatures, bwlimit, state.OS.ExecPath)
+	err = RsyncSend(volume.Name, path, conn, wrapper, s.rsyncFeatures, bwlimit, state.OS.ExecPath)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (s rsyncStorageSourceDriver) SendWhileRunning(conn *websocket.Conn, op *operation, bwlimit string, containerOnly bool) error {
-	ctName, _, _ := containerGetParentAndSnapshotName(s.container.Name())
+	ctName, _, _ := shared.ContainerGetParentAndSnapshotName(s.container.Name())
 
 	if !containerOnly {
 		for _, send := range s.snapshots {
@@ -85,7 +105,7 @@ func (s rsyncStorageSourceDriver) SendWhileRunning(conn *websocket.Conn, op *ope
 			path := send.Path()
 			wrapper := StorageProgressReader(op, "fs_progress", send.Name())
 			state := s.container.DaemonState()
-			err = RsyncSend(projectPrefix(s.container.Project(), ctName), shared.AddSlash(path), conn, wrapper, s.rsyncFeatures, bwlimit, state.OS.ExecPath)
+			err = RsyncSend(project.Prefix(s.container.Project(), ctName), shared.AddSlash(path), conn, wrapper, s.rsyncFeatures, bwlimit, state.OS.ExecPath)
 			if err != nil {
 				return err
 			}
@@ -105,14 +125,14 @@ func (s rsyncStorageSourceDriver) SendWhileRunning(conn *websocket.Conn, op *ope
 		}
 	}
 
-	return RsyncSend(projectPrefix(s.container.Project(), ctName), shared.AddSlash(s.container.Path()), conn, wrapper, s.rsyncFeatures, bwlimit, state.OS.ExecPath)
+	return RsyncSend(project.Prefix(s.container.Project(), ctName), shared.AddSlash(s.container.Path()), conn, wrapper, s.rsyncFeatures, bwlimit, state.OS.ExecPath)
 }
 
 func (s rsyncStorageSourceDriver) SendAfterCheckpoint(conn *websocket.Conn, bwlimit string) error {
-	ctName, _, _ := containerGetParentAndSnapshotName(s.container.Name())
+	ctName, _, _ := shared.ContainerGetParentAndSnapshotName(s.container.Name())
 	// resync anything that changed between our first send and the checkpoint
 	state := s.container.DaemonState()
-	return RsyncSend(projectPrefix(s.container.Project(), ctName), shared.AddSlash(s.container.Path()), conn, nil, s.rsyncFeatures, bwlimit, state.OS.ExecPath)
+	return RsyncSend(project.Prefix(s.container.Project(), ctName), shared.AddSlash(s.container.Path()), conn, nil, s.rsyncFeatures, bwlimit, state.OS.ExecPath)
 }
 
 func (s rsyncStorageSourceDriver) Cleanup() {
@@ -132,7 +152,7 @@ func rsyncRefreshSource(refreshSnapshots []string, args MigrationSourceArgs) (Mi
 		}
 
 		for _, snap := range allSnapshots {
-			_, snapName, _ := containerGetParentAndSnapshotName(snap.Name())
+			_, snapName, _ := shared.ContainerGetParentAndSnapshotName(snap.Name())
 			if !shared.StringInSlice(snapName, refreshSnapshots) {
 				continue
 			}
@@ -164,7 +184,7 @@ func snapshotProtobufToContainerArgs(project string, containerName string, snap 
 		config[ent.GetKey()] = ent.GetValue()
 	}
 
-	devices := types.Devices{}
+	devices := deviceConfig.Devices{}
 	for _, ent := range snap.LocalDevices {
 		props := map[string]string{}
 		for _, prop := range ent.Config {
@@ -215,8 +235,45 @@ func rsyncStorageMigrationSink(conn *websocket.Conn, op *operation, args Migrati
 	pool := args.Storage.GetStoragePool()
 	volume := args.Storage.GetStoragePoolVolume()
 
+	if !args.VolumeOnly {
+		for _, snap := range args.Snapshots {
+			target := api.StorageVolumeSnapshotsPost{
+				Name: fmt.Sprintf("%s/%s", volume.Name, *snap.Name),
+			}
+
+			dbArgs := &db.StorageVolumeArgs{
+				Name:        fmt.Sprintf("%s/%s", volume.Name, *snap.Name),
+				PoolName:    pool.Name,
+				TypeName:    volume.Type,
+				Snapshot:    true,
+				Config:      volume.Config,
+				Description: volume.Description,
+			}
+
+			_, err = storagePoolVolumeSnapshotDBCreateInternal(args.Storage.GetState(), dbArgs)
+			if err != nil {
+				return err
+			}
+
+			wrapper := StorageProgressWriter(op, "fs_progress", target.Name)
+			path := driver.GetStoragePoolVolumeMountPoint(pool.Name, volume.Name)
+			path = shared.AddSlash(path)
+			logger.Debugf("Starting to receive storage volume snapshot %s on storage pool %s into %s", target.Name, pool.Name, path)
+
+			err = RsyncRecv(path, conn, wrapper, args.RsyncFeatures)
+			if err != nil {
+				return err
+			}
+
+			err = args.Storage.StoragePoolVolumeSnapshotCreate(&target)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
 	wrapper := StorageProgressWriter(op, "fs_progress", volume.Name)
-	path := getStoragePoolVolumeMountPoint(pool.Name, volume.Name)
+	path := driver.GetStoragePoolVolumeMountPoint(pool.Name, volume.Name)
 	path = shared.AddSlash(path)
 	logger.Debugf("Starting to receive storage volume %s on storage pool %s into %s", volume.Name, pool.Name, path)
 	return RsyncRecv(path, conn, wrapper, args.RsyncFeatures)
@@ -235,7 +292,7 @@ func rsyncMigrationSink(conn *websocket.Conn, op *operation, args MigrationSinkA
 	// disk device so we can simply retrieve it from the expanded devices.
 	parentStoragePool := ""
 	parentExpandedDevices := args.Container.ExpandedDevices()
-	parentLocalRootDiskDeviceKey, parentLocalRootDiskDevice, _ := shared.GetRootDiskDevice(parentExpandedDevices)
+	parentLocalRootDiskDeviceKey, parentLocalRootDiskDevice, _ := shared.GetRootDiskDevice(parentExpandedDevices.CloneNative())
 	if parentLocalRootDiskDeviceKey != "" {
 		parentStoragePool = parentLocalRootDiskDevice["pool"]
 	}
@@ -278,7 +335,7 @@ func rsyncMigrationSink(conn *websocket.Conn, op *operation, args MigrationSinkA
 				// profile on the new instance as well we don't need to
 				// do anything.
 				if snapArgs.Devices != nil {
-					snapLocalRootDiskDeviceKey, _, _ := shared.GetRootDiskDevice(snapArgs.Devices)
+					snapLocalRootDiskDeviceKey, _, _ := shared.GetRootDiskDevice(snapArgs.Devices.CloneNative())
 					if snapLocalRootDiskDeviceKey != "" {
 						snapArgs.Devices[snapLocalRootDiskDeviceKey]["pool"] = parentStoragePool
 					}
@@ -339,7 +396,7 @@ func rsyncMigrationSink(conn *websocket.Conn, op *operation, args MigrationSinkA
 				// profile on the new instance as well we don't need to
 				// do anything.
 				if snapArgs.Devices != nil {
-					snapLocalRootDiskDeviceKey, _, _ := shared.GetRootDiskDevice(snapArgs.Devices)
+					snapLocalRootDiskDeviceKey, _, _ := shared.GetRootDiskDevice(snapArgs.Devices.CloneNative())
 					if snapLocalRootDiskDeviceKey != "" {
 						snapArgs.Devices[snapLocalRootDiskDeviceKey]["pool"] = parentStoragePool
 					}

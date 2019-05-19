@@ -16,6 +16,9 @@ ceph.osd.pg\_num                | string    | ceph driver                       
 ceph.osd.pool\_name             | string    | ceph driver                       | name of the pool           | storage\_driver\_ceph              | Name of the osd storage pool.
 ceph.rbd.clone\_copy            | string    | ceph driver                       | true                       | storage\_driver\_ceph              | Whether to use RBD lightweight clones rather than full dataset copies.
 ceph.user.name                  | string    | ceph driver                       | admin                      | storage\_ceph\_user\_name          | The ceph user to use when creating storage pools and volumes.
+cephfs.cluster\_name            | string    | cephfs driver                     | ceph                       | storage\_driver\_cephfs            | Name of the ceph cluster in which to create new storage pools.
+cephfs.path                     | string    | cephfs driver                     | /                          | storage\_driver\_cephfs            | The base path for the CEPHFS mount
+cephfs.user.name                | string    | cephfs driver                     | admin                      | storage\_driver\_cephfs            | The ceph user to use when creating storage pools and volumes.
 lvm.thinpool\_name              | string    | lvm driver                        | LXDThinPool                | storage                            | Thin pool where images and containers are created.
 lvm.use\_thinpool               | bool      | lvm driver                        | true                       | storage\_lvm\_use\_thinpool        | Whether the storage pool uses a thinpool for logical volumes.
 lvm.vg\_name                    | string    | lvm driver                        | name of the pool           | storage                            | Name of the volume group to create.
@@ -24,7 +27,7 @@ volatile.initial\_source        | string    | -                                 
 volatile.pool.pristine          | string    | -                                 | true                       | storage\_driver\_ceph              | Whether the pool has been empty on creation time.
 volume.block.filesystem         | string    | block based driver (lvm)          | ext4                       | storage                            | Filesystem to use for new volumes
 volume.block.mount\_options     | string    | block based driver (lvm)          | discard                    | storage                            | Mount options for block devices
-volume.size                     | string    | appropriate driver                | 0                          | storage                            | Default volume size
+volume.size                     | string    | appropriate driver                | unlimited (10GB for block) | storage                            | Default volume size
 volume.zfs.remove\_snapshots    | bool      | zfs driver                        | false                      | storage                            | Remove snapshots as needed
 volume.zfs.use\_refquota        | bool      | zfs driver                        | false                      | storage                            | Use refquota instead of quota for space.
 zfs.clone\_copy                 | bool      | zfs driver                        | true                       | storage\_zfs\_clone\_copy          | Whether to use ZFS lightweight clones rather than full dataset copies.
@@ -40,11 +43,12 @@ lxc storage set [<remote>:]<pool> <key> <value>
 Key                     | Type      | Condition                 | Default                               | API Extension     | Description
 :--                     | :---      | :--------                 | :------                               | :------------     | :----------
 size                    | string    | appropriate driver        | same as volume.size                   | storage           | Size of the storage volume
-block.filesystem        | string    | block based driver (lvm)  | same as volume.block.filesystem       | storage           | Filesystem of the storage volume
-block.mount\_options    | string    | block based driver (lvm)  | same as volume.block.mount\_options   | storage           | Mount options for block devices
+block.filesystem        | string    | block based driver        | same as volume.block.filesystem       | storage           | Filesystem of the storage volume
+block.mount\_options    | string    | block based driver        | same as volume.block.mount\_options   | storage           | Mount options for block devices
+security.shifted        | bool      | custom volume             | false                                 | storage\_shifted  | Enable id shifting overlay (allows attach by multiple isolated containers)
 security.unmapped       | bool      | custom volume             | false                                 | storage\_unmapped | Disable id mapping for the volume
 zfs.remove\_snapshots   | string    | zfs driver                | same as volume.zfs.remove\_snapshots  | storage           | Remove snapshots as needed
-zfs.use\_refquota       | string    | zfs driver                | same as volume.zfs.zfs\_requota       | storage           | Use refquota instead of quota for space.
+zfs.use\_refquota       | string    | zfs driver                | same as volume.zfs.zfs\_requota       | storage           | Use refquota instead of quota for space
 
 Storage volume configuration keys can be set using the lxc tool with:
 
@@ -69,7 +73,7 @@ Block based                                 | no        | no    | yes   | no   |
 Instant cloning                             | no        | yes   | yes   | yes  | yes
 Storage driver usable inside a container    | yes       | yes   | no    | no   | no
 Restore from older snapshots (not latest)   | yes       | yes   | yes   | no   | yes
-Storage quotas                              | no        | yes   | yes   | yes  | no
+Storage quotas                              | yes(\*)   | yes   | yes   | yes  | no
 
 ## Recommended setup
 The two best options for use with LXD are ZFS and btrfs.  
@@ -162,6 +166,8 @@ This also means that access to cached data will not be affected by the limit.
  - While this backend is fully functional, it's also much slower than
    all the others due to it having to unpack images or do instant copies of
    containers, snapshots and images.
+ - Quotas are supported with the directory backend when running on
+   either ext4 or XFS with project quotas enabled at the filesystem level.
 
 #### The following commands can be used to create directory storage pools
 
@@ -225,6 +231,11 @@ lxc storage create pool1 ceph ceph.osd.pool\_name=my-osd
 ```bash
 lxc storage create pool1 ceph source=my-already-existing-osd
 ```
+
+### CEPHFS
+
+ - Can only be used for custom storage volumes
+ - Supports snapshots if enabled on the server side
 
 ### Btrfs
 

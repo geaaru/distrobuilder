@@ -82,11 +82,15 @@ test_static_analysis() {
       #golint -set_exit_status lxd/migration
       golint -set_exit_status lxd/node
       golint -set_exit_status lxd/state
+      golint -set_exit_status lxd/storage
       golint -set_exit_status lxd/sys
       golint -set_exit_status lxd/task
       golint -set_exit_status lxd/template
-      golint -set_exit_status lxd/types
       golint -set_exit_status lxd/util
+      golint -set_exit_status lxd/device/...
+      golint -set_exit_status lxd/dnsmasq/...
+      golint -set_exit_status lxd/iptables/...
+      golint -set_exit_status lxd/instance/...
 
       golint -set_exit_status shared/api/
       golint -set_exit_status shared/cancel/
@@ -97,6 +101,7 @@ test_static_analysis() {
       golint -set_exit_status shared/log15/stack
       golint -set_exit_status shared/logger/
       golint -set_exit_status shared/logging/
+      golint -set_exit_status shared/simplestreams/
       golint -set_exit_status shared/subtest/
       golint -set_exit_status shared/termios/
       golint -set_exit_status shared/version/
@@ -107,7 +112,7 @@ test_static_analysis() {
 
     ## deadcode
     if which deadcode >/dev/null 2>&1; then
-      OUT=$(deadcode ./fuidshift ./lxc ./lxd ./lxd/types ./shared ./shared/api ./shared/i18n ./shared/ioprogress ./shared/logging ./shared/osarch ./shared/simplestreams ./shared/termios ./shared/version ./lxd-benchmark 2>&1 | grep -v lxd/migrate.pb.go: | grep -v /C: | grep -vi _cgo | grep -vi _cfunc || true)
+      OUT=$(deadcode ./fuidshift ./lxc ./lxd ./shared ./shared/api ./shared/i18n ./shared/ioprogress ./shared/logging ./shared/osarch ./shared/simplestreams ./shared/termios ./shared/version ./lxd-benchmark 2>&1 | grep -v lxd/migrate.pb.go: | grep -v /C: | grep -vi _cgo | grep -vi _cfunc || true)
       if [ -n "${OUT}" ]; then
         echo "${OUT}" >&2
         false

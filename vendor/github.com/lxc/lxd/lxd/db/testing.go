@@ -6,12 +6,14 @@ import (
 	"io/ioutil"
 	"net"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/CanonicalLtd/go-dqlite"
-	"github.com/CanonicalLtd/raft-test"
-	"github.com/hashicorp/raft"
+	dqlite "github.com/canonical/go-dqlite"
+	"github.com/canonical/go-dqlite/client"
+	"github.com/canonical/go-dqlite/driver"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -55,7 +57,7 @@ func NewTestNodeTx(t *testing.T) (*NodeTx, func()) {
 // that can be used to clean it up when done.
 func NewTestCluster(t *testing.T) (*Cluster, func()) {
 	// Create an in-memory dqlite SQL server and associated store.
-	store, serverCleanup := newDqliteServer(t)
+	dir, store, serverCleanup := NewTestDqliteServer(t)
 
 	log := newLogFunc(t)
 
@@ -64,8 +66,8 @@ func NewTestCluster(t *testing.T) (*Cluster, func()) {
 	}
 
 	cluster, err := OpenCluster(
-		"test.db", store, "1", "/unused/db/dir", 5*time.Second,
-		dqlite.WithLogFunc(log), dqlite.WithDialFunc(dial))
+		"test.db", store, "1", dir, 5*time.Second, nil,
+		driver.WithLogFunc(log), driver.WithDialFunc(dial))
 	require.NoError(t, err)
 
 	cleanup := func() {
@@ -96,52 +98,66 @@ func NewTestClusterTx(t *testing.T) (*ClusterTx, func()) {
 	return clusterTx, cleanup
 }
 
-// Create a new in-memory dqlite server.
+// NewTestDqliteServer creates a new test dqlite server.
 //
-// Return the newly created server store can be used to connect to it.
-func newDqliteServer(t *testing.T) (*dqlite.DatabaseServerStore, func()) {
+// Return the directory backing the test server and a newly created server
+// store that can be used to connect to it.
+func NewTestDqliteServer(t *testing.T) (string, driver.NodeStore, func()) {
 	t.Helper()
 
 	listener, err := net.Listen("unix", "")
 	require.NoError(t, err)
 
 	address := listener.Addr().String()
+	listener.Close()
 
-	store, err := dqlite.DefaultServerStore(":memory:")
+	dir, dirCleanup := newDir(t)
+	err = os.Mkdir(filepath.Join(dir, "global"), 0755)
 	require.NoError(t, err)
-	require.NoError(t, store.Set(context.Background(), []dqlite.ServerInfo{{Address: address}}))
 
-	id := fmt.Sprintf("%d", dqliteSerial)
-	dqliteSerial++
-	registry := dqlite.NewRegistry(id)
+	server, err := dqlite.New(
+		uint64(1), address, filepath.Join(dir, "global"), dqlite.WithBindAddress(address))
+	require.NoError(t, err)
 
-	fsm := dqlite.NewFSM(registry)
-
-	r, raftCleanup := rafttest.Server(t, fsm, rafttest.Transport(func(i int) raft.Transport {
-		require.Equal(t, i, 0)
-		address := raft.ServerAddress(listener.Addr().String())
-		_, transport := raft.NewInmemTransport(address)
-		return transport
-	}))
-
-	log := newLogFunc(t)
-
-	server, err := dqlite.NewServer(
-		r, registry, listener, dqlite.WithServerLogFunc(log))
+	err = server.Start()
 	require.NoError(t, err)
 
 	cleanup := func() {
 		require.NoError(t, server.Close())
-		raftCleanup()
+		dirCleanup()
 	}
 
-	return store, cleanup
+	store, err := driver.DefaultNodeStore(":memory:")
+	require.NoError(t, err)
+	ctx := context.Background()
+	require.NoError(t, store.Set(ctx, []driver.NodeInfo{{Address: address}}))
+
+	return dir, store, cleanup
 }
 
 var dqliteSerial = 0
 
-func newLogFunc(t *testing.T) dqlite.LogFunc {
-	return func(l dqlite.LogLevel, format string, a ...interface{}) {
+// Return a new temporary directory.
+func newDir(t *testing.T) (string, func()) {
+	t.Helper()
+
+	dir, err := ioutil.TempDir("", "dqlite-replication-test-")
+	assert.NoError(t, err)
+
+	cleanup := func() {
+		_, err := os.Stat(dir)
+		if err != nil {
+			assert.True(t, os.IsNotExist(err))
+		} else {
+			assert.NoError(t, os.RemoveAll(dir))
+		}
+	}
+
+	return dir, cleanup
+}
+
+func newLogFunc(t *testing.T) client.LogFunc {
+	return func(l client.LogLevel, format string, a ...interface{}) {
 		format = fmt.Sprintf("%s: %s", l.String(), format)
 		t.Logf(format, a...)
 	}
