@@ -15,12 +15,14 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
+	"golang.org/x/sys/unix"
 
 	"github.com/lxc/lxd/lxd/cluster"
 	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/logger"
+	"github.com/lxc/lxd/shared/netutils"
 	"github.com/lxc/lxd/shared/version"
 
 	log "github.com/lxc/lxd/shared/log15"
@@ -41,6 +43,9 @@ type execWs struct {
 	fds              map[int]string
 	width            int
 	height           int
+	uid              uint32
+	gid              uint32
+	cwd              string
 }
 
 func (s *execWs) Metadata() interface{} {
@@ -182,7 +187,7 @@ func (s *execWs) Do(op *operation) error {
 					}
 
 					// If an abnormal closure occurred, kill the attached process.
-					err := syscall.Kill(attachedChildPid, syscall.SIGKILL)
+					err := unix.Kill(attachedChildPid, unix.SIGKILL)
 					if err != nil {
 						logger.Debugf("Failed to send SIGKILL to pid %d", attachedChildPid)
 					} else {
@@ -223,7 +228,7 @@ func (s *execWs) Do(op *operation) error {
 						continue
 					}
 				} else if command.Command == "signal" {
-					if err := syscall.Kill(attachedChildPid, syscall.Signal(command.Signal)); err != nil {
+					if err := unix.Kill(attachedChildPid, unix.Signal(command.Signal)); err != nil {
 						logger.Debugf("Failed forwarding signal '%d' to PID %d", command.Signal, attachedChildPid)
 						continue
 					}
@@ -238,7 +243,7 @@ func (s *execWs) Do(op *operation) error {
 			s.connsLock.Unlock()
 
 			logger.Debugf("Starting to mirror websocket")
-			readDone, writeDone := shared.WebsocketExecMirror(conn, ptys[0], ptys[0], attachedChildIsDead, int(ptys[0].Fd()))
+			readDone, writeDone := netutils.WebsocketExecMirror(conn, ptys[0], ptys[0], attachedChildIsDead, int(ptys[0].Fd()))
 
 			<-readDone
 			<-writeDone
@@ -306,7 +311,7 @@ func (s *execWs) Do(op *operation) error {
 		return cmdErr
 	}
 
-	cmd, _, attachedPid, err := s.container.Exec(s.command, s.env, stdin, stdout, stderr, false)
+	cmd, _, attachedPid, err := s.container.Exec(s.command, s.env, stdin, stdout, stderr, false, s.cwd, s.uid, s.gid)
 	if err != nil {
 		return err
 	}
@@ -404,19 +409,22 @@ func containerExecPost(d *Daemon, r *http.Request) Response {
 		}
 	}
 
-	// Set default value for HOME
-	_, ok = env["HOME"]
-	if !ok {
-		env["HOME"] = "/root"
+	// If running as root, set some env variables
+	if post.User == 0 {
+		// Set default value for HOME
+		_, ok = env["HOME"]
+		if !ok {
+			env["HOME"] = "/root"
+		}
+
+		// Set default value for USER
+		_, ok = env["USER"]
+		if !ok {
+			env["USER"] = "root"
+		}
 	}
 
-	// Set default value for USER
-	_, ok = env["USER"]
-	if !ok {
-		env["USER"] = "root"
-	}
-
-	// Set default value for USER
+	// Set default value for LANG
 	_, ok = env["LANG"]
 	if !ok {
 		env["LANG"] = "C.UTF-8"
@@ -459,6 +467,10 @@ func containerExecPost(d *Daemon, r *http.Request) Response {
 		ws.width = post.Width
 		ws.height = post.Height
 
+		ws.cwd = post.Cwd
+		ws.uid = post.User
+		ws.gid = post.Group
+
 		resources := map[string][]string{}
 		resources["containers"] = []string{ws.container.Name()}
 
@@ -490,7 +502,7 @@ func containerExecPost(d *Daemon, r *http.Request) Response {
 			defer stderr.Close()
 
 			// Run the command
-			_, cmdResult, _, cmdErr = c.Exec(post.Command, env, nil, stdout, stderr, true)
+			_, cmdResult, _, cmdErr = c.Exec(post.Command, env, nil, stdout, stderr, true, post.Cwd, post.User, post.Group)
 
 			// Update metadata with the right URLs
 			metadata["return"] = cmdResult
@@ -499,7 +511,7 @@ func containerExecPost(d *Daemon, r *http.Request) Response {
 				"2": fmt.Sprintf("/%s/containers/%s/logs/%s", version.APIVersion, c.Name(), filepath.Base(stderr.Name())),
 			}
 		} else {
-			_, cmdResult, _, cmdErr = c.Exec(post.Command, env, nil, nil, nil, true)
+			_, cmdResult, _, cmdErr = c.Exec(post.Command, env, nil, nil, nil, true, post.Cwd, post.User, post.Group)
 			metadata["return"] = cmdResult
 		}
 

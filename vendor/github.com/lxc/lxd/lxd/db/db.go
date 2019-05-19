@@ -3,15 +3,18 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
-	"github.com/CanonicalLtd/go-dqlite"
+	"github.com/canonical/go-dqlite/driver"
 	"github.com/pkg/errors"
 
 	"github.com/lxc/lxd/lxd/db/cluster"
 	"github.com/lxc/lxd/lxd/db/node"
 	"github.com/lxc/lxd/lxd/db/query"
+	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/logger"
 )
 
@@ -58,7 +61,10 @@ func OpenNode(dir string, fresh func(*Node) error, legacyPatches map[int]*Legacy
 		return nil, nil, err
 	}
 
-	legacyHook := legacyPatchHook(db, legacyPatches)
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
+	legacyHook := legacyPatchHook(legacyPatches)
 	hook := func(version int, tx *sql.Tx) error {
 		if version == node.UpdateFromPreClustering {
 			logger.Debug("Loading pre-clustering sqlite data")
@@ -88,9 +94,6 @@ func OpenNode(dir string, fresh func(*Node) error, legacyPatches map[int]*Legacy
 			}
 		}
 	}
-
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
 
 	return node, dump, nil
 }
@@ -153,16 +156,21 @@ type Cluster struct {
 // - dialer: Function used to connect to the dqlite backend via gRPC SQL.
 // - address: Network address of this node (or empty string).
 // - dir: Base LXD database directory (e.g. /var/lib/lxd/database)
+// - timeout: Give up trying to open the database after this amount of time.
+// - dump: If not nil, a copy of 2.0 db data, for migrating to 3.0.
 //
 // The address and api parameters will be used to determine if the cluster
 // database matches our version, and possibly trigger a schema update. If the
 // schema update can't be performed right now, because some nodes are still
 // behind, an Upgrading error is returned.
-func OpenCluster(name string, store dqlite.ServerStore, address, dir string, timeout time.Duration, options ...dqlite.DriverOption) (*Cluster, error) {
+func OpenCluster(name string, store driver.NodeStore, address, dir string, timeout time.Duration, dump *Dump, options ...driver.Option) (*Cluster, error) {
 	db, err := cluster.Open(name, store, options...)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to open database")
 	}
+
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 
 	// Test that the cluster database is operational. We wait up to the
 	// given timeout , in case there's no quorum of nodes online yet.
@@ -186,7 +194,7 @@ func OpenCluster(name string, store dqlite.ServerStore, address, dir string, tim
 		}
 
 		cause := errors.Cause(err)
-		if cause != dqlite.ErrNoAvailableLeader {
+		if cause != driver.ErrNoAvailableLeader {
 			return nil, err
 		}
 
@@ -205,13 +213,34 @@ func OpenCluster(name string, store dqlite.ServerStore, address, dir string, tim
 		}
 	}
 
+	if dump != nil {
+		logger.Infof("Migrating data from local to global database")
+		err := query.Transaction(db, func(tx *sql.Tx) error {
+			return importPreClusteringData(tx, dump)
+		})
+		if err != nil {
+			// Restore the local sqlite3 backup and wipe the raft
+			// directory, so users can fix problems and retry.
+			path := filepath.Join(dir, "local.db")
+			copyErr := shared.FileCopy(path+".bak", path)
+			if copyErr != nil {
+				// Ignore errors here, there's not much we can do
+				logger.Errorf("Failed to restore local database: %v", copyErr)
+			}
+			rmErr := os.RemoveAll(filepath.Join(dir, "global"))
+			if rmErr != nil {
+				// Ignore errors here, there's not much we can do
+				logger.Errorf("Failed to cleanup global database: %v", rmErr)
+			}
+
+			return nil, errors.Wrap(err, "Failed to migrate data to global database")
+		}
+	}
+
 	nodesVersionsMatch, err := cluster.EnsureSchema(db, address, dir)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to ensure schema")
 	}
-
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
 
 	if !nodesVersionsMatch {
 		cluster := &Cluster{
@@ -286,7 +315,7 @@ func ForLocalInspectionWithPreparedStmts(db *sql.DB) (*Cluster, error) {
 
 // SetDefaultTimeout sets the default go-dqlite driver timeout.
 func (c *Cluster) SetDefaultTimeout(timeout time.Duration) {
-	driver := c.db.Driver().(*dqlite.Driver)
+	driver := c.db.Driver().(*driver.Driver)
 	driver.SetContextTimeout(timeout)
 }
 

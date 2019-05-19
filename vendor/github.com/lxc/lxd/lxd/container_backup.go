@@ -149,7 +149,7 @@ func containerBackupsPost(d *Daemon, r *http.Request) Response {
 			Name:             fullName,
 			ContainerID:      c.Id(),
 			CreationDate:     time.Now(),
-			ExpiryDate:       req.ExpiryDate,
+			ExpiryDate:       req.ExpiresAt,
 			ContainerOnly:    req.ContainerOnly,
 			OptimizedStorage: req.OptimizedStorage,
 		}
@@ -226,7 +226,7 @@ func containerBackupPost(d *Daemon, r *http.Request) Response {
 	oldName := name + shared.SnapshotDelimiter + backupName
 	backup, err := backupLoadByName(d.State(), project, oldName)
 	if err != nil {
-		SmartError(err)
+		return SmartError(err)
 	}
 
 	newName := name + shared.SnapshotDelimiter + req.Name

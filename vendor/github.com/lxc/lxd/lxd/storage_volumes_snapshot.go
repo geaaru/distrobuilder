@@ -9,24 +9,27 @@ import (
 	"github.com/gorilla/mux"
 
 	"github.com/lxc/lxd/lxd/db"
+	driver "github.com/lxc/lxd/lxd/storage"
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/version"
 )
 
-var storagePoolVolumeSnapshotsTypeCmd = Command{
-	name: "storage-pools/{pool}/volumes/{type}/{name}/snapshots",
-	post: storagePoolVolumeSnapshotsTypePost,
-	get:  storagePoolVolumeSnapshotsTypeGet,
+var storagePoolVolumeSnapshotsTypeCmd = APIEndpoint{
+	Name: "storage-pools/{pool}/volumes/{type}/{name}/snapshots",
+
+	Get:  APIEndpointAction{Handler: storagePoolVolumeSnapshotsTypeGet, AccessHandler: AllowAuthenticated},
+	Post: APIEndpointAction{Handler: storagePoolVolumeSnapshotsTypePost},
 }
 
-var storagePoolVolumeSnapshotTypeCmd = Command{
-	name:   "storage-pools/{pool}/volumes/{type}/{name}/snapshots/{snapshotName}",
-	post:   storagePoolVolumeSnapshotTypePost,
-	get:    storagePoolVolumeSnapshotTypeGet,
-	put:    storagePoolVolumeSnapshotTypePut,
-	delete: storagePoolVolumeSnapshotTypeDelete,
+var storagePoolVolumeSnapshotTypeCmd = APIEndpoint{
+	Name: "storage-pools/{pool}/volumes/{type}/{name}/snapshots/{snapshotName}",
+
+	Delete: APIEndpointAction{Handler: storagePoolVolumeSnapshotTypeDelete},
+	Get:    APIEndpointAction{Handler: storagePoolVolumeSnapshotTypeGet, AccessHandler: AllowAuthenticated},
+	Post:   APIEndpointAction{Handler: storagePoolVolumeSnapshotTypePost},
+	Put:    APIEndpointAction{Handler: storagePoolVolumeSnapshotTypePut},
 }
 
 func storagePoolVolumeSnapshotsTypePost(d *Daemon, r *http.Request) Response {
@@ -54,7 +57,7 @@ func storagePoolVolumeSnapshotsTypePost(d *Daemon, r *http.Request) Response {
 
 	// Check that the storage volume type is valid.
 	if !shared.IntInSlice(volumeType, supportedVolumeTypes) {
-		return BadRequest(fmt.Errorf("invalid storage volume type \"%d\"", volumeType))
+		return BadRequest(fmt.Errorf("Invalid storage volume type \"%d\"", volumeType))
 	}
 
 	// Get a snapshot name.
@@ -64,9 +67,19 @@ func storagePoolVolumeSnapshotsTypePost(d *Daemon, r *http.Request) Response {
 	}
 
 	// Validate the name
-	err = storageValidName(req.Name)
+	err = driver.ValidName(req.Name)
 	if err != nil {
 		return BadRequest(err)
+	}
+
+	// Check that this isn't a restricted volume
+	used, err := daemonStorageUsed(d.State(), poolName, volumeName)
+	if err != nil {
+		return InternalError(err)
+	}
+
+	if used {
+		return BadRequest(fmt.Errorf("Volumes used by LXD itself cannot have snapshots"))
 	}
 
 	// Retrieve ID of the storage pool (and check if the storage pool
@@ -92,7 +105,7 @@ func storagePoolVolumeSnapshotsTypePost(d *Daemon, r *http.Request) Response {
 		return SmartError(err)
 	}
 
-	// Ensure that it doens't already fucking exist
+	// Ensure that the snapshot doens't already exist
 	_, _, err = d.cluster.StoragePoolNodeVolumeGetType(fmt.Sprintf("%s/%s", volumeName, req.Name), volumeType, poolID)
 	if err != db.ErrNoSuchObject {
 		if err != nil {
@@ -186,7 +199,7 @@ func storagePoolVolumeSnapshotsTypeGet(d *Daemon, r *http.Request) Response {
 	resultString := []string{}
 	resultMap := []*api.StorageVolumeSnapshot{}
 	for _, volume := range volumes {
-		_, snapshotName, _ := containerGetParentAndSnapshotName(volume)
+		_, snapshotName, _ := shared.ContainerGetParentAndSnapshotName(volume)
 
 		if !recursion {
 			apiEndpoint, err := storagePoolVolumeTypeToAPIEndpoint(volumeType)
@@ -200,7 +213,7 @@ func storagePoolVolumeSnapshotsTypeGet(d *Daemon, r *http.Request) Response {
 				continue
 			}
 
-			volumeUsedBy, err := storagePoolVolumeUsedByGet(d.State(), "default", vol.Name, vol.Type)
+			volumeUsedBy, err := storagePoolVolumeUsedByGet(d.State(), "default", poolName, vol.Name, vol.Type)
 			if err != nil {
 				return SmartError(err)
 			}

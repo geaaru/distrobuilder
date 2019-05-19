@@ -69,7 +69,7 @@ func (m *Method) Generate(buf *file.Buffer) error {
 }
 
 func (m *Method) uris(buf *file.Buffer) error {
-	mapping, err := Parse(m.packages[m.pkg], lex.Capital(m.entity))
+	mapping, err := Parse(m.packages[m.pkg], lex.Camel(m.entity))
 	if err != nil {
 		return errors.Wrap(err, "Parse entity struct")
 	}
@@ -92,6 +92,9 @@ func (m *Method) uris(buf *file.Buffer) error {
 	buf.L("criteria := map[string]interface{}{}")
 
 	for _, name := range criteria {
+		if name == "Parent" {
+			continue
+		}
 		field := mapping.FieldByName(name)
 		if field == nil {
 			return fmt.Errorf("No field named %q in filter struct", name)
@@ -143,7 +146,7 @@ func (m *Method) uris(buf *file.Buffer) error {
 }
 
 func (m *Method) list(buf *file.Buffer) error {
-	mapping, err := Parse(m.packages[m.pkg], lex.Capital(m.entity))
+	mapping, err := Parse(m.packages[m.pkg], lex.Camel(m.entity))
 	if err != nil {
 		return errors.Wrap(err, "Parse entity struct")
 	}
@@ -172,11 +175,17 @@ func (m *Method) list(buf *file.Buffer) error {
 	buf.L("criteria := map[string]interface{}{}")
 
 	for _, name := range criteria {
-		field := mapping.FieldByName(name)
-		if field == nil {
-			return fmt.Errorf("No field named %q in filter struct", name)
+		var zero string
+		if name == "Parent" {
+			zero = `""`
+		} else {
+			field := mapping.FieldByName(name)
+			if field == nil {
+				return fmt.Errorf("No field named %q in filter struct", name)
+			}
+			zero = field.ZeroValue()
 		}
-		buf.L("if filter.%s != %s {", name, field.ZeroValue())
+		buf.L("if filter.%s != %s {", name, zero)
 		buf.L("        criteria[%q] = filter.%s", name, name)
 		buf.L("}")
 	}
@@ -198,7 +207,12 @@ func (m *Method) list(buf *file.Buffer) error {
 		buf.L("args = []interface{}{")
 
 		for _, name := range filter {
-			buf.L("filter.%s,", name)
+			if name == "Parent" {
+				buf.L("len(filter.Parent)+1,")
+				buf.L("filter.%s+\"/\",", name)
+			} else {
+				buf.L("filter.%s,", name)
+			}
 		}
 
 		buf.L("}")
@@ -239,7 +253,7 @@ func (m *Method) list(buf *file.Buffer) error {
 }
 
 func (m *Method) get(buf *file.Buffer) error {
-	mapping, err := Parse(m.packages[m.pkg], lex.Capital(m.entity))
+	mapping, err := Parse(m.packages[m.pkg], lex.Camel(m.entity))
 	if err != nil {
 		return errors.Wrap(err, "Parse entity struct")
 	}
@@ -260,13 +274,13 @@ func (m *Method) get(buf *file.Buffer) error {
 		buf.L("filter.%s = %s", field.Name, lex.Minuscule(field.Name))
 	}
 	// FIXME: snowflake
-	if m.entity == "container" {
+	if m.entity == "instance" {
 		buf.L("filter.Type = -1")
 	}
 	buf.N()
-	buf.L("objects, err := c.%sList(filter)", lex.Capital(m.entity))
+	buf.L("objects, err := c.%sList(filter)", lex.Camel(m.entity))
 	buf.L("if err != nil {")
-	buf.L("        return nil, errors.Wrap(err, \"Failed to fetch %s\")", lex.Capital(m.entity))
+	buf.L("        return nil, errors.Wrap(err, \"Failed to fetch %s\")", lex.Camel(m.entity))
 	buf.L("}")
 	buf.N()
 	buf.L("switch len(objects) {")
@@ -282,7 +296,7 @@ func (m *Method) get(buf *file.Buffer) error {
 }
 
 func (m *Method) ref(buf *file.Buffer) error {
-	mapping, err := Parse(m.packages[m.pkg], lex.Capital(m.entity))
+	mapping, err := Parse(m.packages[m.pkg], lex.Camel(m.entity))
 	if err != nil {
 		return errors.Wrap(err, "Parse entity struct")
 	}
@@ -372,11 +386,17 @@ func (m *Method) ref(buf *file.Buffer) error {
 	buf.L("criteria := map[string]interface{}{}")
 
 	for _, name := range criteria {
-		field := mapping.FieldByName(name)
-		if !field.IsPrimary() {
-			continue
+		var zero string
+		if name == "Parent" {
+			zero = `""`
+		} else {
+			field := mapping.FieldByName(name)
+			if !field.IsPrimary() {
+				continue
+			}
+			zero = field.ZeroValue()
 		}
-		buf.L("if filter.%s != %s {", name, field.ZeroValue())
+		buf.L("if filter.%s != %s {", name, zero)
 		buf.L("        criteria[%q] = filter.%s", name, name)
 		buf.L("}")
 	}
@@ -433,8 +453,8 @@ func (m *Method) ref(buf *file.Buffer) error {
 		needle += fmt.Sprintf("[object.%s]", key.Name)
 
 		subIndexTyp := indexType(nk[i+1:], retTyp)
-		buf.L("        _, ok := index%s", needle)
-		buf.L("        if !ok {")
+		buf.L("        _, ok%d := index%s", i, needle)
+		buf.L("        if !ok%d {", i)
 		buf.L("                subIndex := %s{}", subIndexTyp)
 		buf.L("                index%s = subIndex", needle)
 		buf.L("        }")
@@ -485,7 +505,7 @@ func (m *Method) ref(buf *file.Buffer) error {
 // natural key of the entity.
 func (m *Method) fillSliceReferenceField(buf *file.Buffer, nk []*Field, field *Field) error {
 	objectsVar := fmt.Sprintf("%sObjects", lex.Minuscule(field.Name))
-	methodName := fmt.Sprintf("%s%sRef", lex.Capital(m.entity), field.Name)
+	methodName := fmt.Sprintf("%s%sRef", lex.Camel(m.entity), field.Name)
 
 	buf.L("// Fill field %s.", field.Name)
 	buf.L("%s, err := c.%s(filter)", objectsVar, methodName)
@@ -498,8 +518,8 @@ func (m *Method) fillSliceReferenceField(buf *file.Buffer, nk []*Field, field *F
 	for i, key := range nk[:len(nk)-1] {
 		needle += fmt.Sprintf("[objects[i].%s]", key.Name)
 		subIndexTyp := indexType(nk[i+1:], field.Type.Name)
-		buf.L("        _, ok := %s%s", objectsVar, needle)
-		buf.L("        if !ok {")
+		buf.L("        _, ok%d := %s%s", i, objectsVar, needle)
+		buf.L("        if !ok%d {", i)
 		buf.L("                subIndex := %s{}", subIndexTyp)
 		buf.L("                %s%s = subIndex", objectsVar, needle)
 		buf.L("        }")
@@ -589,7 +609,7 @@ func (m *Method) exists(buf *file.Buffer) error {
 	m.begin(buf, comment, args, rets)
 	defer m.end(buf)
 
-	buf.L("_, err := c.%sID(%s)", lex.Capital(m.entity), FieldParams(nk))
+	buf.L("_, err := c.%sID(%s)", lex.Camel(m.entity), FieldParams(nk))
 	buf.L("if err != nil {")
 	buf.L("        if err == ErrNoSuchObject {")
 	buf.L("                return false, nil")
@@ -631,7 +651,7 @@ func (m *Method) create(buf *file.Buffer) error {
 	}
 
 	buf.L("// Check if a %s with the same key exists.", m.entity)
-	buf.L("exists, err := c.%sExists(%s)", lex.Capital(m.entity), strings.Join(nkParams, ", "))
+	buf.L("exists, err := c.%sExists(%s)", lex.Camel(m.entity), strings.Join(nkParams, ", "))
 	buf.L("if err != nil {")
 	buf.L("        return -1, errors.Wrap(err, \"Failed to check for duplicates\")")
 	buf.L("}")
@@ -725,7 +745,7 @@ func (m *Method) create(buf *file.Buffer) error {
 }
 
 func (m *Method) rename(buf *file.Buffer) error {
-	mapping, err := Parse(m.packages[m.pkg], lex.Capital(m.entity))
+	mapping, err := Parse(m.packages[m.pkg], lex.Camel(m.entity))
 	if err != nil {
 		return errors.Wrap(err, "Parse entity struct")
 	}
@@ -759,7 +779,7 @@ func (m *Method) rename(buf *file.Buffer) error {
 }
 
 func (m *Method) update(buf *file.Buffer) error {
-	mapping, err := Parse(m.packages[m.pkg], lex.Capital(m.entity))
+	mapping, err := Parse(m.packages[m.pkg], lex.Camel(m.entity))
 	if err != nil {
 		return errors.Wrap(err, "Parse entity struct")
 	}
@@ -811,7 +831,7 @@ func (m *Method) update(buf *file.Buffer) error {
 }
 
 func (m *Method) delete(buf *file.Buffer) error {
-	mapping, err := Parse(m.packages[m.pkg], lex.Capital(m.entity))
+	mapping, err := Parse(m.packages[m.pkg], lex.Camel(m.entity))
 	if err != nil {
 		return errors.Wrap(err, "Parse entity struct")
 	}
@@ -845,7 +865,7 @@ func (m *Method) delete(buf *file.Buffer) error {
 }
 
 func (m *Method) begin(buf *file.Buffer, comment string, args string, rets string) {
-	name := fmt.Sprintf("%s%s", lex.Capital(m.entity), m.kind)
+	name := fmt.Sprintf("%s%s", lex.Camel(m.entity), m.kind)
 	receiver := fmt.Sprintf("c %s", dbTxType(m.db))
 
 	buf.L("// %s %s", name, comment)

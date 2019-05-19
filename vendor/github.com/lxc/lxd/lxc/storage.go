@@ -7,9 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 
-	"github.com/olekukonko/tablewriter"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v2"
 
@@ -18,6 +16,7 @@ import (
 	cli "github.com/lxc/lxd/shared/cmd"
 	"github.com/lxc/lxd/shared/i18n"
 	"github.com/lxc/lxd/shared/termios"
+	"github.com/lxc/lxd/shared/units"
 )
 
 type cmdStorage struct {
@@ -258,7 +257,7 @@ func (c *cmdStorageEdit) Run(cmd *cobra.Command, args []string) error {
 	}
 
 	// If stdin isn't a terminal, read text from it
-	if !termios.IsTerminal(int(syscall.Stdin)) {
+	if !termios.IsTerminal(getStdinFd()) {
 		contents, err := ioutil.ReadAll(os.Stdin)
 		if err != nil {
 			return err
@@ -472,8 +471,8 @@ func (c *cmdStorageInfo) Run(cmd *cobra.Command, args []string) error {
 		poolinfo[infostring][totalspacestring] = strconv.FormatUint(res.Space.Total, 10)
 		poolinfo[infostring][spaceusedstring] = strconv.FormatUint(res.Space.Used, 10)
 	} else {
-		poolinfo[infostring][totalspacestring] = shared.GetByteSizeString(int64(res.Space.Total), 2)
-		poolinfo[infostring][spaceusedstring] = shared.GetByteSizeString(int64(res.Space.Used), 2)
+		poolinfo[infostring][totalspacestring] = units.GetByteSizeString(int64(res.Space.Total), 2)
+		poolinfo[infostring][spaceusedstring] = units.GetByteSizeString(int64(res.Space.Used), 2)
 	}
 
 	poolinfodata, err := yaml.Marshal(poolinfo)
@@ -496,6 +495,8 @@ func (c *cmdStorageInfo) Run(cmd *cobra.Command, args []string) error {
 type cmdStorageList struct {
 	global  *cmdGlobal
 	storage *cmdStorage
+
+	flagFormat string
 }
 
 func (c *cmdStorageList) Command() *cobra.Command {
@@ -505,6 +506,7 @@ func (c *cmdStorageList) Command() *cobra.Command {
 	cmd.Short = i18n.G("List available storage pools")
 	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
 		`List available storage pools`))
+	cmd.Flags().StringVar(&c.flagFormat, "format", "table", i18n.G("Format (csv|json|table|yaml)")+"``")
 
 	cmd.RunE = c.Run
 
@@ -549,11 +551,7 @@ func (c *cmdStorageList) Run(cmd *cobra.Command, args []string) error {
 		details = append(details, usedby)
 		data = append(data, details)
 	}
-
-	table := tablewriter.NewWriter(os.Stdout)
-	table.SetAutoWrapText(false)
-	table.SetAlignment(tablewriter.ALIGN_LEFT)
-	table.SetRowLine(true)
+	sort.Sort(byName(data))
 
 	header := []string{
 		i18n.G("NAME"),
@@ -566,13 +564,8 @@ func (c *cmdStorageList) Run(cmd *cobra.Command, args []string) error {
 		header = append(header, i18n.G("SOURCE"))
 	}
 	header = append(header, i18n.G("USED BY"))
-	table.SetHeader(header)
 
-	sort.Sort(byName(data))
-	table.AppendBulk(data)
-	table.Render()
-
-	return nil
+	return renderTable(c.flagFormat, header, data, pools)
 }
 
 // Set
@@ -586,7 +579,10 @@ func (c *cmdStorageSet) Command() *cobra.Command {
 	cmd.Use = i18n.G("set [<remote>:]<pool> <key> <value>")
 	cmd.Short = i18n.G("Set storage pool configuration keys")
 	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
-		`Set storage pool configuration keys`))
+		`Set storage pool configuration keys
+
+For backward compatibility, a single configuration key may still be set with:
+    lxc storage set [<remote>:]<pool> <key> <value>`))
 
 	cmd.Flags().StringVar(&c.storage.flagTarget, "target", "", i18n.G("Cluster member name")+"``")
 	cmd.RunE = c.Run
@@ -596,16 +592,13 @@ func (c *cmdStorageSet) Command() *cobra.Command {
 
 func (c *cmdStorageSet) Run(cmd *cobra.Command, args []string) error {
 	// Sanity checks
-	exit, err := c.global.CheckArgs(cmd, args, 3, 3)
+	exit, err := c.global.CheckArgs(cmd, args, 2, -1)
 	if exit {
 		return err
 	}
 
 	// Parse remote
-	remote := ""
-	if len(args) > 0 {
-		remote = args[0]
-	}
+	remote := args[0]
 
 	resources, err := c.global.ParseServers(remote)
 	if err != nil {
@@ -613,7 +606,6 @@ func (c *cmdStorageSet) Run(cmd *cobra.Command, args []string) error {
 	}
 
 	resource := resources[0]
-
 	if resource.name == "" {
 		return fmt.Errorf(i18n.G("Missing pool name"))
 	}
@@ -624,18 +616,16 @@ func (c *cmdStorageSet) Run(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Read the value
-	value := args[2]
-	if !termios.IsTerminal(int(syscall.Stdin)) && value == "-" {
-		buf, err := ioutil.ReadAll(os.Stdin)
-		if err != nil {
-			return fmt.Errorf(i18n.G("Can't read from stdin: %s"), err)
-		}
-		value = string(buf[:])
+	// Parse key/values
+	keys, err := getConfig(args[1:]...)
+	if err != nil {
+		return err
 	}
 
 	// Update the pool
-	pool.Config[args[1]] = value
+	for k, v := range keys {
+		pool.Config[k] = v
+	}
 
 	err = resource.server.UpdateStoragePool(resource.name, pool.Writable(), etag)
 	if err != nil {

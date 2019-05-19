@@ -1,26 +1,26 @@
 package main
 
 import (
+	"database/sql"
 	"fmt"
 	"io/ioutil"
-	stdlog "log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
-	"time"
 
-	"github.com/boltdb/bolt"
-	"github.com/hashicorp/raft"
-	"github.com/hashicorp/raft-boltdb"
+	"github.com/pkg/errors"
+	"golang.org/x/sys/unix"
+
 	"github.com/lxc/lxd/lxd/cluster"
 	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/lxd/db/query"
+	deviceConfig "github.com/lxc/lxd/lxd/device/config"
+	driver "github.com/lxc/lxd/lxd/storage"
 	"github.com/lxc/lxd/shared"
-	"github.com/lxc/lxd/shared/logger"
-	"github.com/pkg/errors"
-
 	log "github.com/lxc/lxd/shared/log15"
+	"github.com/lxc/lxd/shared/logger"
 )
 
 /* Patches are one-time actions that are sometimes needed to update
@@ -69,6 +69,9 @@ var patches = []patch{
 	{name: "storage_api_rename_container_snapshots_dir", run: patchStorageApiRenameContainerSnapshotsDir},
 	{name: "storage_api_rename_container_snapshots_links", run: patchStorageApiUpdateContainerSnapshots},
 	{name: "fix_lvm_pool_volume_names", run: patchRenameCustomVolumeLVs},
+	{name: "storage_api_rename_container_snapshots_dir_again", run: patchStorageApiRenameContainerSnapshotsDir},
+	{name: "storage_api_rename_container_snapshots_links_again", run: patchStorageApiUpdateContainerSnapshots},
+	{name: "storage_api_rename_container_snapshots_dir_again_again", run: patchStorageApiRenameContainerSnapshotsDir},
 }
 
 type patch struct {
@@ -235,111 +238,9 @@ func patchNetworkPermissions(name string, d *Daemon) error {
 	return nil
 }
 
-// Shrink a database/global/logs.db that grew unwildly due to a bug in the 3.6
-// release.
+// This patch used to shrink the database/global/logs.db file, but it's not
+// needed anymore since dqlite 1.0.
 func patchShrinkLogsDBFile(name string, d *Daemon) error {
-	dir := filepath.Join(d.os.VarDir, "database", "global")
-	info, err := os.Stat(filepath.Join(dir, "logs.db"))
-	if err != nil {
-		if os.IsNotExist(err) {
-			// The boltdb file is not there at all, nothing to do.
-			return nil
-		}
-		return errors.Wrap(err, "Get the size of the boltdb database")
-	}
-
-	if info.Size() < 1024*1024*100 {
-		// Only try to shrink databases bigger than 100 Megabytes.
-		return nil
-	}
-
-	snaps, err := raft.NewFileSnapshotStoreWithLogger(
-		dir, 2, stdlog.New(ioutil.Discard, "", 0))
-	if err != nil {
-		return errors.Wrap(err, "Open snapshots")
-	}
-
-	metas, err := snaps.List()
-	if err != nil {
-		return errors.Wrap(err, "Fetch snapshots")
-	}
-
-	if len(metas) == 0 {
-		// No snapshot is available, we can't shrink. This should never
-		// happen, in practice.
-		logger.Warnf("Can't shrink boltdb store, no raft snapshot is available")
-		return nil
-	}
-
-	meta := metas[0] // The most recent snapshot.
-
-	// Copy all log entries from the current boltdb file into a new one,
-	// which will be smaller since it excludes all truncated entries that
-	pathCur := filepath.Join(dir, "logs.db")
-	// got allocated before the latest snapshot.
-	logsCur, err := raftboltdb.New(raftboltdb.Options{
-		Path: pathCur,
-		BoltOptions: &bolt.Options{
-			Timeout:  10 * time.Second,
-			ReadOnly: true,
-		},
-	})
-	if err != nil {
-		return errors.Wrap(err, "Open current boltdb store")
-	}
-	defer logsCur.Close()
-
-	pathNew := filepath.Join(dir, "logs.db.new")
-	logsNew, err := raftboltdb.New(raftboltdb.Options{
-		Path:        pathNew,
-		BoltOptions: &bolt.Options{Timeout: 10 * time.Second},
-	})
-	if err != nil {
-		return errors.Wrap(err, "Open new boltdb store")
-	}
-	defer logsNew.Close()
-
-	lastIndex, err := logsCur.LastIndex()
-	if err != nil {
-		return errors.Wrap(err, "Get most recent raft index")
-	}
-
-	for index := meta.Index; index <= lastIndex; index++ {
-		log := &raft.Log{}
-
-		err := logsCur.GetLog(index, log)
-		if err != nil {
-			return errors.Wrapf(err, "Get raft entry at index %d", index)
-		}
-
-		err = logsNew.StoreLog(log)
-		if err != nil {
-			return errors.Wrapf(err, "Store raft entry at index %d", index)
-		}
-	}
-
-	term, err := logsCur.GetUint64([]byte("CurrentTerm"))
-	if err != nil {
-		return errors.Wrap(err, "Get current term")
-	}
-	err = logsNew.SetUint64([]byte("CurrentTerm"), term)
-	if err != nil {
-		return errors.Wrap(err, "Store current term")
-	}
-
-	logsCur.Close()
-	logsNew.Close()
-
-	err = os.Remove(pathCur)
-	if err != nil {
-		return errors.Wrap(err, "Remove current boltdb store")
-	}
-
-	err = os.Rename(pathNew, pathCur)
-	if err != nil {
-		return errors.Wrap(err, "Rename new boltdb store")
-	}
-
 	return nil
 }
 
@@ -388,13 +289,13 @@ func patchStorageApi(name string, d *Daemon) error {
 	// Check if this LXD instace currently has any containers, snapshots, or
 	// images configured. If so, we create a default storage pool in the
 	// database. Otherwise, the user will have to run LXD init.
-	cRegular, err := d.cluster.LegacyContainersList(db.CTypeRegular)
+	cRegular, err := d.cluster.LegacyContainersList()
 	if err != nil {
 		return err
 	}
 
 	// Get list of existing snapshots.
-	cSnapshots, err := d.cluster.LegacyContainersList(db.CTypeSnapshot)
+	cSnapshots, err := d.cluster.LegacySnapshotsList()
 	if err != nil {
 		return err
 	}
@@ -485,7 +386,7 @@ func patchStorageApi(name string, d *Daemon) error {
 
 func upgradeFromStorageTypeBtrfs(name string, d *Daemon, defaultPoolName string, defaultStorageTypeName string, cRegular []string, cSnapshots []string, imgPublic []string, imgPrivate []string) error {
 	poolConfig := map[string]string{}
-	poolSubvolumePath := getStoragePoolMountPoint(defaultPoolName)
+	poolSubvolumePath := driver.GetStoragePoolMountPoint(defaultPoolName)
 	poolConfig["source"] = poolSubvolumePath
 
 	err := storagePoolValidateConfig(defaultPoolName, defaultStorageTypeName, poolConfig, nil)
@@ -498,7 +399,7 @@ func upgradeFromStorageTypeBtrfs(name string, d *Daemon, defaultPoolName string,
 		return err
 	}
 
-	poolID := int64(-1)
+	var poolID int64
 	pools, err := d.cluster.StoragePools()
 	if err == nil { // Already exist valid storage pools.
 		// Check if the storage pool already has a db entry.
@@ -548,7 +449,7 @@ func upgradeFromStorageTypeBtrfs(name string, d *Daemon, defaultPoolName string,
 
 	if len(cRegular) > 0 {
 		// ${LXD_DIR}/storage-pools/<name>
-		containersSubvolumePath := getContainerMountPoint("default", defaultPoolName, "")
+		containersSubvolumePath := driver.GetContainerMountPoint("default", defaultPoolName, "")
 		if !shared.PathExists(containersSubvolumePath) {
 			err := os.MkdirAll(containersSubvolumePath, 0711)
 			if err != nil {
@@ -595,7 +496,7 @@ func upgradeFromStorageTypeBtrfs(name string, d *Daemon, defaultPoolName string,
 		// subvolume of the subvolume of the storage pool:
 		// mv ${LXD_DIR}/containers/<container_name> ${LXD_DIR}/storage-pools/<pool>/<container_name>
 		oldContainerMntPoint := shared.VarPath("containers", ct)
-		newContainerMntPoint := getContainerMountPoint("default", defaultPoolName, ct)
+		newContainerMntPoint := driver.GetContainerMountPoint("default", defaultPoolName, ct)
 		if shared.PathExists(oldContainerMntPoint) && !shared.PathExists(newContainerMntPoint) {
 			err = os.Rename(oldContainerMntPoint, newContainerMntPoint)
 			if err != nil {
@@ -604,7 +505,7 @@ func upgradeFromStorageTypeBtrfs(name string, d *Daemon, defaultPoolName string,
 					return err
 				}
 
-				output, err := rsyncLocalCopy(oldContainerMntPoint, newContainerMntPoint, "")
+				output, err := rsyncLocalCopy(oldContainerMntPoint, newContainerMntPoint, "", true)
 				if err != nil {
 					logger.Errorf("Failed to rsync: %s: %s", output, err)
 					return err
@@ -624,7 +525,7 @@ func upgradeFromStorageTypeBtrfs(name string, d *Daemon, defaultPoolName string,
 		// ${LXD_DIR}/containers/<container_name> to
 		// ${LXD_DIR}/storage-pools/<pool>/containers/<container_name>
 		doesntMatter := false
-		err = createContainerMountpoint(newContainerMntPoint, oldContainerMntPoint, doesntMatter)
+		err = driver.CreateContainerMountpoint(newContainerMntPoint, oldContainerMntPoint, doesntMatter)
 		if err != nil {
 			return err
 		}
@@ -639,7 +540,7 @@ func upgradeFromStorageTypeBtrfs(name string, d *Daemon, defaultPoolName string,
 			// Create the snapshots directory in
 			// the new storage pool:
 			// ${LXD_DIR}/storage-pools/<pool>/snapshots
-			newSnapshotsMntPoint := getSnapshotMountPoint("default", defaultPoolName, ct)
+			newSnapshotsMntPoint := driver.GetSnapshotMountPoint("default", defaultPoolName, ct)
 			if !shared.PathExists(newSnapshotsMntPoint) {
 				err := os.MkdirAll(newSnapshotsMntPoint, 0700)
 				if err != nil {
@@ -682,16 +583,16 @@ func upgradeFromStorageTypeBtrfs(name string, d *Daemon, defaultPoolName string,
 			// We need to create a new snapshot since we can't move
 			// readonly snapshots.
 			oldSnapshotMntPoint := shared.VarPath("snapshots", cs)
-			newSnapshotMntPoint := getSnapshotMountPoint("default", defaultPoolName, cs)
+			newSnapshotMntPoint := driver.GetSnapshotMountPoint("default", defaultPoolName, cs)
 			if shared.PathExists(oldSnapshotMntPoint) && !shared.PathExists(newSnapshotMntPoint) {
-				err = btrfsSnapshot(oldSnapshotMntPoint, newSnapshotMntPoint, true)
+				err = btrfsSnapshot(d.State(), oldSnapshotMntPoint, newSnapshotMntPoint, true)
 				if err != nil {
 					err := btrfsSubVolumeCreate(newSnapshotMntPoint)
 					if err != nil {
 						return err
 					}
 
-					output, err := rsyncLocalCopy(oldSnapshotMntPoint, newSnapshotMntPoint, "")
+					output, err := rsyncLocalCopy(oldSnapshotMntPoint, newSnapshotMntPoint, "", true)
 					if err != nil {
 						logger.Errorf("Failed to rsync: %s: %s", output, err)
 						return err
@@ -720,7 +621,7 @@ func upgradeFromStorageTypeBtrfs(name string, d *Daemon, defaultPoolName string,
 			// storage pool:
 			// ${LXD_DIR}/snapshots/<container_name> to ${LXD_DIR}/storage-pools/<pool>/snapshots/<container_name>
 			snapshotsPath := shared.VarPath("snapshots", ct)
-			newSnapshotMntPoint := getSnapshotMountPoint("default", defaultPoolName, ct)
+			newSnapshotMntPoint := driver.GetSnapshotMountPoint("default", defaultPoolName, ct)
 			os.Remove(snapshotsPath)
 			if !shared.PathExists(snapshotsPath) {
 				err := os.Symlink(newSnapshotMntPoint, snapshotsPath)
@@ -760,7 +661,7 @@ func upgradeFromStorageTypeBtrfs(name string, d *Daemon, defaultPoolName string,
 			return err
 		}
 
-		imagesMntPoint := getImageMountPoint(defaultPoolName, "")
+		imagesMntPoint := driver.GetImageMountPoint(defaultPoolName, "")
 		if !shared.PathExists(imagesMntPoint) {
 			err := os.MkdirAll(imagesMntPoint, 0700)
 			if err != nil {
@@ -769,7 +670,7 @@ func upgradeFromStorageTypeBtrfs(name string, d *Daemon, defaultPoolName string,
 		}
 
 		oldImageMntPoint := shared.VarPath("images", img+".btrfs")
-		newImageMntPoint := getImageMountPoint(defaultPoolName, img)
+		newImageMntPoint := driver.GetImageMountPoint(defaultPoolName, img)
 		if shared.PathExists(oldImageMntPoint) && !shared.PathExists(newImageMntPoint) {
 			err := os.Rename(oldImageMntPoint, newImageMntPoint)
 			if err != nil {
@@ -795,7 +696,7 @@ func upgradeFromStorageTypeDir(name string, d *Daemon, defaultPoolName string, d
 		return err
 	}
 
-	poolID := int64(-1)
+	var poolID int64
 	pools, err := d.cluster.StoragePools()
 	if err == nil { // Already exist valid storage pools.
 		// Check if the storage pool already has a db entry.
@@ -880,7 +781,7 @@ func upgradeFromStorageTypeDir(name string, d *Daemon, defaultPoolName string, d
 
 		// Create the new path where containers will be located on the
 		// new storage api.
-		containersMntPoint := getContainerMountPoint("default", defaultPoolName, "")
+		containersMntPoint := driver.GetContainerMountPoint("default", defaultPoolName, "")
 		if !shared.PathExists(containersMntPoint) {
 			err := os.MkdirAll(containersMntPoint, 0711)
 			if err != nil {
@@ -890,12 +791,12 @@ func upgradeFromStorageTypeDir(name string, d *Daemon, defaultPoolName string, d
 
 		// Simply rename the container when they are directories.
 		oldContainerMntPoint := shared.VarPath("containers", ct)
-		newContainerMntPoint := getContainerMountPoint("default", defaultPoolName, ct)
+		newContainerMntPoint := driver.GetContainerMountPoint("default", defaultPoolName, ct)
 		if shared.PathExists(oldContainerMntPoint) && !shared.PathExists(newContainerMntPoint) {
 			// First try to rename.
 			err := os.Rename(oldContainerMntPoint, newContainerMntPoint)
 			if err != nil {
-				output, err := rsyncLocalCopy(oldContainerMntPoint, newContainerMntPoint, "")
+				output, err := rsyncLocalCopy(oldContainerMntPoint, newContainerMntPoint, "", true)
 				if err != nil {
 					logger.Errorf("Failed to rsync: %s: %s", output, err)
 					return err
@@ -908,7 +809,7 @@ func upgradeFromStorageTypeDir(name string, d *Daemon, defaultPoolName string, d
 		}
 
 		doesntMatter := false
-		err = createContainerMountpoint(newContainerMntPoint, oldContainerMntPoint, doesntMatter)
+		err = driver.CreateContainerMountpoint(newContainerMntPoint, oldContainerMntPoint, doesntMatter)
 		if err != nil {
 			return err
 		}
@@ -938,11 +839,11 @@ func upgradeFromStorageTypeDir(name string, d *Daemon, defaultPoolName string, d
 		}
 
 		// Now simply rename the snapshots directory as well.
-		newSnapshotMntPoint := getSnapshotMountPoint("default", defaultPoolName, ct)
+		newSnapshotMntPoint := driver.GetSnapshotMountPoint("default", defaultPoolName, ct)
 		if shared.PathExists(oldSnapshotMntPoint) && !shared.PathExists(newSnapshotMntPoint) {
 			err := os.Rename(oldSnapshotMntPoint, newSnapshotMntPoint)
 			if err != nil {
-				output, err := rsyncLocalCopy(oldSnapshotMntPoint, newSnapshotMntPoint, "")
+				output, err := rsyncLocalCopy(oldSnapshotMntPoint, newSnapshotMntPoint, "", true)
 				if err != nil {
 					logger.Errorf("Failed to rsync: %s: %s", output, err)
 					return err
@@ -955,7 +856,7 @@ func upgradeFromStorageTypeDir(name string, d *Daemon, defaultPoolName string, d
 		}
 
 		// Create a symlink for this container.  snapshots.
-		err = createSnapshotMountpoint(newSnapshotMntPoint, newSnapshotMntPoint, oldSnapshotMntPoint)
+		err = driver.CreateSnapshotMountpoint(newSnapshotMntPoint, newSnapshotMntPoint, oldSnapshotMntPoint)
 		if err != nil {
 			return err
 		}
@@ -1094,7 +995,7 @@ func upgradeFromStorageTypeLvm(name string, d *Daemon, defaultPoolName string, d
 	// Peek into the storage pool database to see whether any storage pools
 	// are already configured. If so, we can assume that a partial upgrade
 	// has been performed and can skip the next steps.
-	poolID := int64(-1)
+	var poolID int64
 	pools, err := d.cluster.StoragePools()
 	if err == nil { // Already exist valid storage pools.
 		// Check if the storage pool already has a db entry.
@@ -1133,7 +1034,7 @@ func upgradeFromStorageTypeLvm(name string, d *Daemon, defaultPoolName string, d
 	}
 
 	// Create pool mountpoint if it doesn't already exist.
-	poolMntPoint := getStoragePoolMountPoint(defaultPoolName)
+	poolMntPoint := driver.GetStoragePoolMountPoint(defaultPoolName)
 	if !shared.PathExists(poolMntPoint) {
 		err = os.MkdirAll(poolMntPoint, 0711)
 		if err != nil {
@@ -1143,7 +1044,7 @@ func upgradeFromStorageTypeLvm(name string, d *Daemon, defaultPoolName string, d
 
 	if len(cRegular) > 0 {
 		// Create generic containers folder on the storage pool.
-		newContainersMntPoint := getContainerMountPoint("default", defaultPoolName, "")
+		newContainersMntPoint := driver.GetContainerMountPoint("default", defaultPoolName, "")
 		if !shared.PathExists(newContainersMntPoint) {
 			err = os.MkdirAll(newContainersMntPoint, 0711)
 			if err != nil {
@@ -1190,7 +1091,7 @@ func upgradeFromStorageTypeLvm(name string, d *Daemon, defaultPoolName string, d
 		// Unmount the logical volume.
 		oldContainerMntPoint := shared.VarPath("containers", ct)
 		if shared.IsMountPoint(oldContainerMntPoint) {
-			err := tryUnmount(oldContainerMntPoint, syscall.MNT_DETACH)
+			err := driver.TryUnmount(oldContainerMntPoint, unix.MNT_DETACH)
 			if err != nil {
 				logger.Errorf("Failed to unmount LVM logical volume \"%s\": %s", oldContainerMntPoint, err)
 				return err
@@ -1200,7 +1101,7 @@ func upgradeFromStorageTypeLvm(name string, d *Daemon, defaultPoolName string, d
 		// Create the new path where containers will be located on the
 		// new storage api. We do os.Rename() here to preserve
 		// permissions and ownership.
-		newContainerMntPoint := getContainerMountPoint("default", defaultPoolName, ct)
+		newContainerMntPoint := driver.GetContainerMountPoint("default", defaultPoolName, ct)
 		ctLvName := containerNameToLVName(ct)
 		newContainerLvName := fmt.Sprintf("%s_%s", storagePoolVolumeAPIEndpointContainers, ctLvName)
 		containerLvDevPath := getLvmDevPath("default", defaultPoolName, storagePoolVolumeAPIEndpointContainers, ctLvName)
@@ -1274,7 +1175,7 @@ func upgradeFromStorageTypeLvm(name string, d *Daemon, defaultPoolName string, d
 				}
 
 				// Use rsync to fill the empty volume.
-				output, err := rsyncLocalCopy(oldContainerMntPoint, newContainerMntPoint, "")
+				output, err := rsyncLocalCopy(oldContainerMntPoint, newContainerMntPoint, "", true)
 				if err != nil {
 					ctStorage.ContainerDelete(ctStruct)
 					return fmt.Errorf("rsync failed: %s", string(output))
@@ -1291,7 +1192,7 @@ func upgradeFromStorageTypeLvm(name string, d *Daemon, defaultPoolName string, d
 
 		// Create the new container mountpoint.
 		doesntMatter := false
-		err = createContainerMountpoint(newContainerMntPoint, oldContainerMntPoint, doesntMatter)
+		err = driver.CreateContainerMountpoint(newContainerMntPoint, oldContainerMntPoint, doesntMatter)
 		if err != nil {
 			logger.Errorf("Failed to create container mountpoint \"%s\" for LVM logical volume: %s", newContainerMntPoint, err)
 			return err
@@ -1345,7 +1246,7 @@ func upgradeFromStorageTypeLvm(name string, d *Daemon, defaultPoolName string, d
 			// Create the snapshots directory in the new storage
 			// pool:
 			// ${LXD_DIR}/storage-pools/<pool>/snapshots
-			newSnapshotMntPoint := getSnapshotMountPoint("default", defaultPoolName, cs)
+			newSnapshotMntPoint := driver.GetSnapshotMountPoint("default", defaultPoolName, cs)
 			if !shared.PathExists(newSnapshotMntPoint) {
 				err := os.MkdirAll(newSnapshotMntPoint, 0700)
 				if err != nil {
@@ -1365,7 +1266,7 @@ func upgradeFromStorageTypeLvm(name string, d *Daemon, defaultPoolName string, d
 				if shared.PathExists(oldLvDevPath) {
 					// Unmount the logical volume.
 					if shared.IsMountPoint(oldSnapshotMntPoint) {
-						err := tryUnmount(oldSnapshotMntPoint, syscall.MNT_DETACH)
+						err := driver.TryUnmount(oldSnapshotMntPoint, unix.MNT_DETACH)
 						if err != nil {
 							logger.Errorf("Failed to unmount LVM logical volume \"%s\": %s", oldSnapshotMntPoint, err)
 							return err
@@ -1428,7 +1329,7 @@ func upgradeFromStorageTypeLvm(name string, d *Daemon, defaultPoolName string, d
 					}
 
 					// Use rsync to fill the empty volume.
-					output, err := rsyncLocalCopy(oldSnapshotMntPoint, newSnapshotMntPoint, "")
+					output, err := rsyncLocalCopy(oldSnapshotMntPoint, newSnapshotMntPoint, "", true)
 					if err != nil {
 						csStorage.ContainerDelete(csStruct)
 						return fmt.Errorf("rsync failed: %s", string(output))
@@ -1450,7 +1351,7 @@ func upgradeFromStorageTypeLvm(name string, d *Daemon, defaultPoolName string, d
 			// storage pool:
 			// ${LXD_DIR}/snapshots/<container_name> to ${LXD_DIR}/storage-pools/<pool>/snapshots/<container_name>
 			snapshotsPath := shared.VarPath("snapshots", ct)
-			newSnapshotsPath := getSnapshotMountPoint("default", defaultPoolName, ct)
+			newSnapshotsPath := driver.GetSnapshotMountPoint("default", defaultPoolName, ct)
 			if shared.PathExists(snapshotsPath) {
 				// On a broken update snapshotsPath will contain
 				// empty directories that need to be removed.
@@ -1468,7 +1369,7 @@ func upgradeFromStorageTypeLvm(name string, d *Daemon, defaultPoolName string, d
 		}
 
 		if !shared.IsMountPoint(newContainerMntPoint) {
-			err := tryMount(containerLvDevPath, newContainerMntPoint, lvFsType, 0, mountOptions)
+			err := driver.TryMount(containerLvDevPath, newContainerMntPoint, lvFsType, 0, mountOptions)
 			if err != nil {
 				logger.Errorf("Failed to mount LVM logical \"%s\" onto \"%s\" : %s", containerLvDevPath, newContainerMntPoint, err)
 				return err
@@ -1478,7 +1379,7 @@ func upgradeFromStorageTypeLvm(name string, d *Daemon, defaultPoolName string, d
 
 	images := append(imgPublic, imgPrivate...)
 	if len(images) > 0 {
-		imagesMntPoint := getImageMountPoint(defaultPoolName, "")
+		imagesMntPoint := driver.GetImageMountPoint(defaultPoolName, "")
 		if !shared.PathExists(imagesMntPoint) {
 			err := os.MkdirAll(imagesMntPoint, 0700)
 			if err != nil {
@@ -1516,7 +1417,7 @@ func upgradeFromStorageTypeLvm(name string, d *Daemon, defaultPoolName string, d
 		// Unmount the logical volume.
 		oldImageMntPoint := shared.VarPath("images", img+".lv")
 		if shared.IsMountPoint(oldImageMntPoint) {
-			err := tryUnmount(oldImageMntPoint, syscall.MNT_DETACH)
+			err := driver.TryUnmount(oldImageMntPoint, unix.MNT_DETACH)
 			if err != nil {
 				return err
 			}
@@ -1529,7 +1430,7 @@ func upgradeFromStorageTypeLvm(name string, d *Daemon, defaultPoolName string, d
 			}
 		}
 
-		newImageMntPoint := getImageMountPoint(defaultPoolName, img)
+		newImageMntPoint := driver.GetImageMountPoint(defaultPoolName, img)
 		if !shared.PathExists(newImageMntPoint) {
 			err := os.MkdirAll(newImageMntPoint, 0700)
 			if err != nil {
@@ -1594,7 +1495,7 @@ func upgradeFromStorageTypeZfs(name string, d *Daemon, defaultPoolName string, d
 	// Peek into the storage pool database to see whether any storage pools
 	// are already configured. If so, we can assume that a partial upgrade
 	// has been performed and can skip the next steps.
-	poolID := int64(-1)
+	var poolID int64
 	pools, err := d.cluster.StoragePools()
 	if err == nil { // Already exist valid storage pools.
 		// Check if the storage pool already has a db entry.
@@ -1667,7 +1568,7 @@ func upgradeFromStorageTypeZfs(name string, d *Daemon, defaultPoolName string, d
 	}
 
 	if len(cRegular) > 0 {
-		containersSubvolumePath := getContainerMountPoint("default", poolName, "")
+		containersSubvolumePath := driver.GetContainerMountPoint("default", poolName, "")
 		if !shared.PathExists(containersSubvolumePath) {
 			err := os.MkdirAll(containersSubvolumePath, 0711)
 			if err != nil {
@@ -1716,7 +1617,7 @@ func upgradeFromStorageTypeZfs(name string, d *Daemon, defaultPoolName string, d
 			_, err := shared.TryRunCommand("zfs", "unmount", "-f", ctDataset)
 			if err != nil {
 				logger.Warnf("Failed to unmount ZFS filesystem via zfs unmount, trying lazy umount (MNT_DETACH)...")
-				err := tryUnmount(oldContainerMntPoint, syscall.MNT_DETACH)
+				err := driver.TryUnmount(oldContainerMntPoint, unix.MNT_DETACH)
 				if err != nil {
 					failedUpgradeEntities = append(failedUpgradeEntities, fmt.Sprintf("containers/%s: Failed to umount zfs filesystem.", ct))
 					continue
@@ -1731,8 +1632,8 @@ func upgradeFromStorageTypeZfs(name string, d *Daemon, defaultPoolName string, d
 		// Changing the mountpoint property should have actually created
 		// the path but in case it somehow didn't let's do it ourselves.
 		doesntMatter := false
-		newContainerMntPoint := getContainerMountPoint("default", poolName, ct)
-		err = createContainerMountpoint(newContainerMntPoint, oldContainerMntPoint, doesntMatter)
+		newContainerMntPoint := driver.GetContainerMountPoint("default", poolName, ct)
+		err = driver.CreateContainerMountpoint(newContainerMntPoint, oldContainerMntPoint, doesntMatter)
 		if err != nil {
 			logger.Warnf("Failed to create mountpoint for the container: %s", newContainerMntPoint)
 			failedUpgradeEntities = append(failedUpgradeEntities, fmt.Sprintf("containers/%s: Failed to create container mountpoint: %s", ct, err))
@@ -1793,7 +1694,7 @@ func upgradeFromStorageTypeZfs(name string, d *Daemon, defaultPoolName string, d
 
 			// Create the new mountpoint for snapshots in the new
 			// storage api.
-			newSnapshotMntPoint := getSnapshotMountPoint("default", poolName, cs)
+			newSnapshotMntPoint := driver.GetSnapshotMountPoint("default", poolName, cs)
 			if !shared.PathExists(newSnapshotMntPoint) {
 				err = os.MkdirAll(newSnapshotMntPoint, 0711)
 				if err != nil {
@@ -1808,7 +1709,7 @@ func upgradeFromStorageTypeZfs(name string, d *Daemon, defaultPoolName string, d
 
 		// Create a symlink for this container's snapshots.
 		if len(ctSnapshots) != 0 {
-			newSnapshotsMntPoint := getSnapshotMountPoint("default", poolName, ct)
+			newSnapshotsMntPoint := driver.GetSnapshotMountPoint("default", poolName, ct)
 			if !shared.PathExists(newSnapshotsMntPoint) {
 				err := os.Symlink(newSnapshotsMntPoint, snapshotsPath)
 				if err != nil {
@@ -1847,7 +1748,7 @@ func upgradeFromStorageTypeZfs(name string, d *Daemon, defaultPoolName string, d
 			return err
 		}
 
-		imageMntPoint := getImageMountPoint(poolName, img)
+		imageMntPoint := driver.GetImageMountPoint(poolName, img)
 		if !shared.PathExists(imageMntPoint) {
 			err := os.MkdirAll(imageMntPoint, 0700)
 			if err != nil {
@@ -1864,7 +1765,7 @@ func upgradeFromStorageTypeZfs(name string, d *Daemon, defaultPoolName string, d
 			_, err := shared.TryRunCommand("zfs", "unmount", "-f", imageDataset)
 			if err != nil {
 				logger.Warnf("Failed to unmount ZFS filesystem via zfs unmount, trying lazy umount (MNT_DETACH)...")
-				err := tryUnmount(oldImageMntPoint, syscall.MNT_DETACH)
+				err := driver.TryUnmount(oldImageMntPoint, unix.MNT_DETACH)
 				if err != nil {
 					logger.Warnf("Failed to unmount ZFS filesystem: %s", err)
 				}
@@ -1959,7 +1860,7 @@ func updatePoolPropertyForAllObjects(d *Daemon, poolName string, allcontainers [
 				continue
 			}
 
-			err = db.DevicesAdd(tx, "profile", pID, p.Devices)
+			err = db.DevicesAdd(tx, "profile", pID, deviceConfig.NewDevices(p.Devices))
 			if err != nil {
 				logger.Errorf("Failed to add new profile profile root disk device: %s: %s", pName, err)
 				tx.Rollback()
@@ -1998,14 +1899,14 @@ func updatePoolPropertyForAllObjects(d *Daemon, poolName string, allcontainers [
 
 		// Check if the container already has a valid root device entry (profile or previous upgrade)
 		expandedDevices := c.ExpandedDevices()
-		k, d, _ := shared.GetRootDiskDevice(expandedDevices)
+		k, d, _ := shared.GetRootDiskDevice(expandedDevices.CloneNative())
 		if k != "" && d["pool"] != "" {
 			continue
 		}
 
 		// Look for a local root device entry
 		localDevices := c.LocalDevices()
-		k, _, _ = shared.GetRootDiskDevice(localDevices)
+		k, _, _ = shared.GetRootDiskDevice(localDevices.CloneNative())
 		if k != "" {
 			localDevices[k]["pool"] = poolName
 		} else {
@@ -2056,13 +1957,13 @@ func patchStorageApiV1(name string, d *Daemon) error {
 		return nil
 	}
 
-	cRegular, err := d.cluster.LegacyContainersList(db.CTypeRegular)
+	cRegular, err := d.cluster.LegacyContainersList()
 	if err != nil {
 		return err
 	}
 
 	// Get list of existing snapshots.
-	cSnapshots, err := d.cluster.LegacyContainersList(db.CTypeSnapshot)
+	cSnapshots, err := d.cluster.LegacySnapshotsList()
 	if err != nil {
 		return err
 	}
@@ -2077,7 +1978,7 @@ func patchStorageApiV1(name string, d *Daemon) error {
 }
 
 func patchContainerConfigRegen(name string, d *Daemon) error {
-	cts, err := d.cluster.LegacyContainersList(db.CTypeRegular)
+	cts, err := d.cluster.LegacyContainersList()
 	if err != nil {
 		return err
 	}
@@ -2442,7 +2343,7 @@ func patchStorageApiLxdOnBtrfs(name string, d *Daemon) error {
 			continue
 		}
 
-		pool.Config["source"] = getStoragePoolMountPoint(poolName)
+		pool.Config["source"] = driver.GetStoragePoolMountPoint(poolName)
 
 		// Update the storage pool config.
 		err = d.cluster.StoragePoolUpdate(poolName, pool.Description, pool.Config)
@@ -2732,7 +2633,7 @@ func patchStorageApiDirBindMount(name string, d *Daemon) error {
 			return fmt.Errorf(msg)
 		}
 		cleanSource := filepath.Clean(source)
-		poolMntPoint := getStoragePoolMountPoint(poolName)
+		poolMntPoint := driver.GetStoragePoolMountPoint(poolName)
 
 		if cleanSource == poolMntPoint {
 			continue
@@ -2751,9 +2652,9 @@ func patchStorageApiDirBindMount(name string, d *Daemon) error {
 		}
 
 		mountSource := cleanSource
-		mountFlags := syscall.MS_BIND
+		mountFlags := unix.MS_BIND
 
-		err = syscall.Mount(mountSource, poolMntPoint, "", uintptr(mountFlags), "")
+		err = unix.Mount(mountSource, poolMntPoint, "", uintptr(mountFlags), "")
 		if err != nil {
 			logger.Errorf(`Failed to mount DIR storage pool "%s" onto "%s": %s`, mountSource, poolMntPoint, err)
 			return err
@@ -2826,7 +2727,7 @@ func patchStorageApiCephSizeRemove(name string, d *Daemon) error {
 }
 
 func patchDevicesNewNamingScheme(name string, d *Daemon) error {
-	cts, err := d.cluster.LegacyContainersList(db.CTypeRegular)
+	cts, err := d.cluster.LegacyContainersList()
 	if err != nil {
 		logger.Errorf("Failed to retrieve containers from database")
 		return err
@@ -2871,7 +2772,7 @@ func patchDevicesNewNamingScheme(name string, d *Daemon) error {
 
 		if !c.IsRunning() {
 			for wipe := range hasDeviceEntry {
-				syscall.Unmount(wipe, syscall.MNT_DETACH)
+				unix.Unmount(wipe, unix.MNT_DETACH)
 				err := os.Remove(wipe)
 				if err != nil {
 					logger.Errorf("Failed to remove device \"%s\": %s", wipe, err)
@@ -2884,18 +2785,16 @@ func patchDevicesNewNamingScheme(name string, d *Daemon) error {
 
 		// go through all devices for each container
 		expandedDevices := c.ExpandedDevices()
-		for _, name := range expandedDevices.DeviceNames() {
-			d := expandedDevices[name]
-
+		for _, dev := range expandedDevices.Sorted() {
 			// We only care about unix-{char,block} and disk devices
 			// since other devices don't create on-disk files.
-			if !shared.StringInSlice(d["type"], []string{"disk", "unix-char", "unix-block"}) {
+			if !shared.StringInSlice(dev.Config["type"], []string{"disk", "unix-char", "unix-block"}) {
 				continue
 			}
 
 			// Handle disks
-			if d["type"] == "disk" {
-				relativeDestPath := strings.TrimPrefix(d["path"], "/")
+			if dev.Config["type"] == "disk" {
+				relativeDestPath := strings.TrimPrefix(dev.Config["path"], "/")
 				hyphenatedDevName := strings.Replace(relativeDestPath, "/", "-", -1)
 				devNameLegacy := fmt.Sprintf("disk.%s", hyphenatedDevName)
 				devPathLegacy := filepath.Join(devicesPath, devNameLegacy)
@@ -2910,7 +2809,7 @@ func patchDevicesNewNamingScheme(name string, d *Daemon) error {
 				// Try to unmount disk devices otherwise we get
 				// EBUSY when we try to rename block devices.
 				// But don't error out.
-				syscall.Unmount(devPathLegacy, syscall.MNT_DETACH)
+				unix.Unmount(devPathLegacy, unix.MNT_DETACH)
 
 				// Switch device to new device naming scheme.
 				devPathNew := filepath.Join(devicesPath, fmt.Sprintf("disk.%s.%s", strings.Replace(name, "/", "-", -1), hyphenatedDevName))
@@ -2924,9 +2823,9 @@ func patchDevicesNewNamingScheme(name string, d *Daemon) error {
 			}
 
 			// Handle unix devices
-			srcPath := d["source"]
+			srcPath := dev.Config["source"]
 			if srcPath == "" {
-				srcPath = d["path"]
+				srcPath = dev.Config["path"]
 			}
 
 			relativeSrcPathLegacy := strings.TrimPrefix(srcPath, "/")
@@ -2941,9 +2840,9 @@ func patchDevicesNewNamingScheme(name string, d *Daemon) error {
 
 			hasDeviceEntry[devPathLegacy] = true
 
-			srcPath = d["path"]
+			srcPath = dev.Config["path"]
 			if srcPath == "" {
-				srcPath = d["source"]
+				srcPath = dev.Config["source"]
 			}
 
 			relativeSrcPathNew := strings.TrimPrefix(srcPath, "/")
@@ -2966,7 +2865,7 @@ func patchDevicesNewNamingScheme(name string, d *Daemon) error {
 
 			// This device is not associated with a device entry, so
 			// wipe it.
-			syscall.Unmount(k, syscall.MNT_DETACH)
+			unix.Unmount(k, unix.MNT_DETACH)
 			err := os.Remove(k)
 			if err != nil {
 				logger.Errorf("Failed to remove device \"%s\": %s", k, err)
@@ -3072,7 +2971,7 @@ func patchStorageApiPermissions(name string, d *Daemon) error {
 				defer volStruct.StoragePoolVolumeUmount()
 			}
 
-			cuMntPoint := getStoragePoolVolumeMountPoint(poolName, vol)
+			cuMntPoint := driver.GetStoragePoolVolumeMountPoint(poolName, vol)
 			err = os.Chmod(cuMntPoint, 0711)
 			if err != nil && !os.IsNotExist(err) {
 				return err
@@ -3080,7 +2979,7 @@ func patchStorageApiPermissions(name string, d *Daemon) error {
 		}
 	}
 
-	cRegular, err := d.cluster.LegacyContainersList(db.CTypeRegular)
+	cRegular, err := d.cluster.LegacyContainersList()
 	if err != nil {
 		return err
 	}
@@ -3147,7 +3046,7 @@ func patchMoveBackups(name string, d *Daemon) error {
 	}
 
 	// Get all containers
-	containers, err := d.cluster.LegacyContainersList(db.CTypeRegular)
+	containers, err := d.cluster.LegacyContainersList()
 	if err != nil {
 		if err != db.ErrNoSuchObject {
 			return err
@@ -3255,29 +3154,138 @@ func patchMoveBackups(name string, d *Daemon) error {
 }
 
 func patchStorageApiRenameContainerSnapshotsDir(name string, d *Daemon) error {
-	storagePoolsPath := shared.VarPath("storage-pools")
-	storagePoolsDir, err := os.Open(storagePoolsPath)
-	if err != nil {
+	pools, err := d.cluster.StoragePools()
+	if err != nil && err == db.ErrNoSuchObject {
+		// No pool was configured so we're on a pristine LXD instance.
+		return nil
+	} else if err != nil {
+		// Database is screwed.
+		logger.Errorf("Failed to query database: %s", err)
 		return err
 	}
 
-	// Get a list of all storage pools.
-	storagePoolNames, err := storagePoolsDir.Readdirnames(-1)
-	storagePoolsDir.Close()
-	if err != nil {
-		return err
-	}
+	// Iterate through all configured pools
+	for _, poolName := range pools {
+		// Make sure the pool is mounted
+		pool, err := storagePoolInit(d.State(), poolName)
+		if err != nil {
+			return err
+		}
 
-	for _, poolName := range storagePoolNames {
+		ourMount, err := pool.StoragePoolMount()
+		if err != nil {
+			return err
+		}
+
+		if ourMount {
+			defer pool.StoragePoolUmount()
+		}
+
+		// Figure out source/target path
 		containerSnapshotDirOld := shared.VarPath("storage-pools", poolName, "snapshots")
 		containerSnapshotDirNew := shared.VarPath("storage-pools", poolName, "containers-snapshots")
-		err := shared.FileMove(containerSnapshotDirOld, containerSnapshotDirNew)
-		if err != nil {
-			if os.IsNotExist(err) {
-				continue
+		if !shared.PathExists(containerSnapshotDirOld) {
+			continue
+		}
+
+		if !shared.PathExists(containerSnapshotDirNew) {
+			// Simple and easy rename (common path)
+			err = os.Rename(containerSnapshotDirOld, containerSnapshotDirNew)
+			if err != nil {
+				return err
+			}
+		} else {
+			// Check if btrfs might have been used
+			hasBtrfs := false
+			_, err = exec.LookPath("btrfs")
+			if err == nil {
+				hasBtrfs = true
 			}
 
-			return err
+			// Get all containers
+			containersDir, err := os.Open(shared.VarPath("storage-pools", poolName, "snapshots"))
+			if err != nil {
+				return err
+			}
+			defer containersDir.Close()
+
+			entries, err := containersDir.Readdirnames(-1)
+			if err != nil {
+				return err
+			}
+
+			for _, entry := range entries {
+				// Create the target (straight rename won't work with btrfs)
+				if !shared.PathExists(filepath.Join(containerSnapshotDirNew, entry)) {
+					err = os.Mkdir(filepath.Join(containerSnapshotDirNew, entry), 0700)
+					if err != nil {
+						return err
+					}
+				}
+
+				// Get all snapshots
+				snapshotsDir, err := os.Open(shared.VarPath("storage-pools", poolName, "snapshots", entry))
+				if err != nil {
+					return err
+				}
+				defer snapshotsDir.Close()
+
+				snaps, err := snapshotsDir.Readdirnames(-1)
+				if err != nil {
+					return err
+				}
+
+				// Disable the read-only properties
+				if hasBtrfs {
+					path := snapshotsDir.Name()
+					subvols, _ := btrfsSubVolumesGet(path)
+					for _, subvol := range subvols {
+						subvol = filepath.Join(path, subvol)
+						newSubvol := filepath.Join(shared.VarPath("storage-pools", poolName, "containers-snapshots", entry), subvol)
+
+						if !btrfsSubVolumeIsRo(subvol) {
+							continue
+						}
+
+						btrfsSubVolumeMakeRw(subvol)
+						defer btrfsSubVolumeMakeRo(newSubvol)
+					}
+				}
+
+				// Rename the snapshots
+				for _, snap := range snaps {
+					err = os.Rename(filepath.Join(containerSnapshotDirOld, entry, snap), filepath.Join(containerSnapshotDirNew, entry, snap))
+					if err != nil {
+						return err
+					}
+				}
+
+				// Cleanup
+				err = os.Remove(snapshotsDir.Name())
+				if err != nil {
+					if hasBtrfs {
+						err1 := btrfsSubVolumeDelete(snapshotsDir.Name())
+						if err1 != nil {
+							return err
+						}
+					} else {
+						return err
+					}
+				}
+			}
+
+			// Cleanup
+			err = os.Remove(containersDir.Name())
+			if err != nil {
+				if hasBtrfs {
+					err1 := btrfsSubVolumeDelete(containersDir.Name())
+					if err1 != nil {
+						return err
+					}
+				} else {
+					return err
+				}
+			}
 		}
 	}
 
@@ -3343,41 +3351,31 @@ func patchStorageApiUpdateContainerSnapshots(name string, d *Daemon) error {
 //
 // NOTE: don't add any legacy patch here, instead use the patches
 // mechanism above.
-var legacyPatches = map[int](func(d *Daemon) error){
+var legacyPatches = map[int](func(tx *sql.Tx) error){
 	11: patchUpdateFromV10,
 	12: patchUpdateFromV11,
 	16: patchUpdateFromV15,
 	30: patchUpdateFromV29,
 	31: patchUpdateFromV30,
 }
-var legacyPatchesNeedingDB = []int{11, 12, 16} // Legacy patches doing DB work
 
-func patchUpdateFromV10(d *Daemon) error {
-	if shared.PathExists(shared.VarPath("lxc")) {
-		err := os.Rename(shared.VarPath("lxc"), shared.VarPath("containers"))
-		if err != nil {
-			return err
-		}
-
-		logger.Debugf("Restarting all the containers following directory rename")
-		s := d.State()
-		containersShutdown(s)
-		containersRestart(s)
-	}
-
+func patchUpdateFromV10(_ *sql.Tx) error {
+	// Logic was moved to Daemon.init().
 	return nil
 }
 
-func patchUpdateFromV11(d *Daemon) error {
-	cNames, err := d.cluster.LegacyContainersList(db.CTypeSnapshot)
+func patchUpdateFromV11(_ *sql.Tx) error {
+	containers, err := containersOnDisk()
 	if err != nil {
 		return err
 	}
 
 	errors := 0
 
+	cNames := containers["default"]
+
 	for _, cName := range cNames {
-		snapParentName, snapOnlyName, _ := containerGetParentAndSnapshotName(cName)
+		snapParentName, snapOnlyName, _ := shared.ContainerGetParentAndSnapshotName(cName)
 		oldPath := shared.VarPath("containers", snapParentName, "snapshots", snapOnlyName)
 		newPath := shared.VarPath("snapshots", snapParentName, snapOnlyName)
 		if shared.PathExists(oldPath) && !shared.PathExists(newPath) {
@@ -3392,7 +3390,7 @@ func patchUpdateFromV11(d *Daemon) error {
 			// containers/<container>/snapshots/<snap0>
 			// to
 			// snapshots/<container>/<snap0>
-			output, err := rsyncLocalCopy(oldPath, newPath, "")
+			output, err := rsyncLocalCopy(oldPath, newPath, "", true)
 			if err != nil {
 				logger.Error(
 					"Failed rsync snapshot",
@@ -3436,27 +3434,22 @@ func patchUpdateFromV11(d *Daemon) error {
 	return nil
 }
 
-func patchUpdateFromV15(d *Daemon) error {
+func patchUpdateFromV15(tx *sql.Tx) error {
 	// munge all LVM-backed containers' LV names to match what is
 	// required for snapshot support
 
-	cNames, err := d.cluster.LegacyContainersList(db.CTypeRegular)
+	containers, err := containersOnDisk()
 	if err != nil {
 		return err
 	}
+	cNames := containers["default"]
 
 	vgName := ""
-	err = d.db.Transaction(func(tx *db.NodeTx) error {
-		config, err := tx.Config()
-		if err != nil {
-			return err
-		}
-		vgName = config["storage.lvm_vg_name"]
-		return nil
-	})
+	config, err := query.SelectConfig(tx, "config", "")
 	if err != nil {
 		return err
 	}
+	vgName = config["storage.lvm_vg_name"]
 
 	for _, cName := range cNames {
 		var lvLinkPath string
@@ -3497,7 +3490,7 @@ func patchUpdateFromV15(d *Daemon) error {
 	return nil
 }
 
-func patchUpdateFromV29(d *Daemon) error {
+func patchUpdateFromV29(_ *sql.Tx) error {
 	if shared.PathExists(shared.VarPath("zfs.img")) {
 		err := os.Chmod(shared.VarPath("zfs.img"), 0600)
 		if err != nil {
@@ -3508,7 +3501,7 @@ func patchUpdateFromV29(d *Daemon) error {
 	return nil
 }
 
-func patchUpdateFromV30(d *Daemon) error {
+func patchUpdateFromV30(_ *sql.Tx) error {
 	entries, err := ioutil.ReadDir(shared.VarPath("containers"))
 	if err != nil {
 		/* If the directory didn't exist before, the user had never

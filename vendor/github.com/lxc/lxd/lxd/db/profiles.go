@@ -4,7 +4,8 @@ import (
 	"database/sql"
 	"fmt"
 
-	"github.com/lxc/lxd/lxd/types"
+	"github.com/lxc/lxd/lxd/device/config"
+	deviceConfig "github.com/lxc/lxd/lxd/device/config"
 	"github.com/lxc/lxd/shared/api"
 	"github.com/pkg/errors"
 )
@@ -276,6 +277,10 @@ func ProfileConfigAdd(tx *sql.Tx, id int64, config map[string]string) error {
 	}
 
 	for k, v := range config {
+		if v == "" {
+			continue
+		}
+
 		_, err = stmt.Exec(id, k, v)
 		if err != nil {
 			return err
@@ -287,7 +292,7 @@ func ProfileConfigAdd(tx *sql.Tx, id int64, config map[string]string) error {
 
 // ProfileContainersGet gets the names of the containers associated with the
 // profile with the given name.
-func (c *Cluster) ProfileContainersGet(project, profile string) ([]string, error) {
+func (c *Cluster) ProfileContainersGet(project, profile string) (map[string][]string, error) {
 	err := c.Transaction(func(tx *ClusterTx) error {
 		enabled, err := tx.ProjectHasProfiles(project)
 		if err != nil {
@@ -302,24 +307,31 @@ func (c *Cluster) ProfileContainersGet(project, profile string) ([]string, error
 		return nil, err
 	}
 
-	q := `SELECT containers.name FROM containers JOIN containers_profiles
-		ON containers.id == containers_profiles.container_id
-		JOIN profiles ON containers_profiles.profile_id == profiles.id
-		JOIN projects ON projects.id == profiles.project_id
-		WHERE projects.name == ? AND profiles.name == ? AND containers.type == 0`
+	q := `SELECT instances.name, projects.name FROM instances
+		JOIN instances_profiles ON instances.id == instances_profiles.instance_id
+		JOIN projects ON projects.id == instances.project_id
+		WHERE instances_profiles.profile_id ==
+		  (SELECT profiles.id FROM profiles
+		   JOIN projects ON projects.id == profiles.project_id
+		   WHERE profiles.name=? AND projects.name=?)
+		AND instances.type == 0`
 
-	results := []string{}
-	inargs := []interface{}{project, profile}
+	results := map[string][]string{}
+	inargs := []interface{}{profile, project}
 	var name string
-	outfmt := []interface{}{name}
+	outfmt := []interface{}{name, name}
 
 	output, err := queryScan(c.db, q, inargs, outfmt)
 	if err != nil {
-		return results, err
+		return nil, err
 	}
 
 	for _, r := range output {
-		results = append(results, r[0].(string))
+		if results[r[1].(string)] == nil {
+			results[r[1].(string)] = []string{}
+		}
+
+		results[r[1].(string)] = append(results[r[1].(string)], r[0].(string))
 	}
 
 	return results, nil
@@ -367,13 +379,13 @@ func ProfilesExpandConfig(config map[string]string, profiles []api.Profile) map[
 
 // ProfilesExpandDevices expands the given container devices with the devices
 // defined in the given profiles.
-func ProfilesExpandDevices(devices types.Devices, profiles []api.Profile) types.Devices {
-	expandedDevices := types.Devices{}
+func ProfilesExpandDevices(devices config.Devices, profiles []api.Profile) config.Devices {
+	expandedDevices := config.Devices{}
 
 	// Apply all the profiles
-	profileDevices := make([]types.Devices, len(profiles))
+	profileDevices := make([]config.Devices, len(profiles))
 	for i, profile := range profiles {
-		profileDevices[i] = profile.Devices
+		profileDevices[i] = deviceConfig.NewDevices(profile.Devices)
 	}
 	for i := range profileDevices {
 		for k, v := range profileDevices[i] {

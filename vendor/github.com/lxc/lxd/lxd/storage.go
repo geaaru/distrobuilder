@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"reflect"
 	"sync"
 	"sync/atomic"
 
@@ -13,15 +12,28 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/lxc/lxd/lxd/db"
+	"github.com/lxc/lxd/lxd/device"
 	"github.com/lxc/lxd/lxd/migration"
 	"github.com/lxc/lxd/lxd/state"
+	driver "github.com/lxc/lxd/lxd/storage"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/idmap"
 	"github.com/lxc/lxd/shared/ioprogress"
 	"github.com/lxc/lxd/shared/logger"
+	"github.com/lxc/lxd/shared/units"
 	"github.com/lxc/lxd/shared/version"
 )
+
+func init() {
+	// Expose storageVolumeMount to the device package as StorageVolumeMount.
+	device.StorageVolumeMount = storageVolumeMount
+	// Expose storageVolumeUmount to the device package as StorageVolumeUmount.
+	device.StorageVolumeUmount = storageVolumeUmount
+	// Expose storageRootFSApplyQuota to the device package as StorageRootFSApplyQuota.
+	device.StorageRootFSApplyQuota = storageRootFSApplyQuota
+
+}
 
 // lxdStorageLockMap is a hashmap that allows functions to check whether the
 // operation they are about to perform is already in progress. If it is the
@@ -84,13 +96,14 @@ type storageType int
 const (
 	storageTypeBtrfs storageType = iota
 	storageTypeCeph
+	storageTypeCephFs
 	storageTypeDir
 	storageTypeLvm
 	storageTypeMock
 	storageTypeZfs
 )
 
-var supportedStoragePoolDrivers = []string{"btrfs", "ceph", "dir", "lvm", "zfs"}
+var supportedStoragePoolDrivers = []string{"btrfs", "ceph", "cephfs", "dir", "lvm", "zfs"}
 
 func storageTypeToString(sType storageType) (string, error) {
 	switch sType {
@@ -98,6 +111,8 @@ func storageTypeToString(sType storageType) (string, error) {
 		return "btrfs", nil
 	case storageTypeCeph:
 		return "ceph", nil
+	case storageTypeCephFs:
+		return "cephfs", nil
 	case storageTypeDir:
 		return "dir", nil
 	case storageTypeLvm:
@@ -117,6 +132,8 @@ func storageStringToType(sName string) (storageType, error) {
 		return storageTypeBtrfs, nil
 	case "ceph":
 		return storageTypeCeph, nil
+	case "cephfs":
+		return storageTypeCephFs, nil
 	case "dir":
 		return storageTypeDir, nil
 	case "lvm":
@@ -176,7 +193,6 @@ type storage interface {
 
 	// ContainerCreateFromImage creates a container from a image.
 	ContainerCreateFromImage(c container, fingerprint string, tracker *ioprogress.ProgressTracker) error
-	ContainerCanRestore(target container, source container) error
 	ContainerDelete(c container) error
 	ContainerCopy(target container, source container, containerOnly bool) error
 	ContainerRefresh(target container, source container, snapshots []container) error
@@ -203,8 +219,6 @@ type storage interface {
 	// Functions dealing with image storage volumes.
 	ImageCreate(fingerprint string, tracker *ioprogress.ProgressTracker) error
 	ImageDelete(fingerprint string) error
-	ImageMount(fingerprint string) (bool, error)
-	ImageUmount(fingerprint string) (bool, error)
 
 	// Storage type agnostic functions.
 	StorageEntitySetQuota(volumeType int, size int64, data interface{}) error
@@ -267,6 +281,13 @@ func storageCoreInit(driver string) (storage, error) {
 			return nil, err
 		}
 		return &ceph, nil
+	case storageTypeCephFs:
+		cephfs := storageCephFs{}
+		err = cephfs.StorageCoreInit()
+		if err != nil {
+			return nil, err
+		}
+		return &cephfs, nil
 	case storageTypeLvm:
 		lvm := storageLvm{}
 		err = lvm.StorageCoreInit()
@@ -309,8 +330,9 @@ func storageInit(s *state.State, project, poolName, volumeName string, volumeTyp
 
 	// Load the storage volume.
 	volume := &api.StorageVolume{}
-	if volumeName != "" && volumeType >= 0 {
-		_, volume, err = s.Cluster.StoragePoolNodeVolumeGetTypeByProject(project, volumeName, volumeType, poolID)
+	volumeID := int64(-1)
+	if volumeName != "" {
+		volumeID, volume, err = s.Cluster.StoragePoolNodeVolumeGetTypeByProject(project, volumeName, volumeType, poolID)
 		if err != nil {
 			return nil, err
 		}
@@ -338,6 +360,7 @@ func storageInit(s *state.State, project, poolName, volumeName string, volumeTyp
 		dir.poolID = poolID
 		dir.pool = pool
 		dir.volume = volume
+		dir.volumeID = volumeID
 		dir.s = s
 		err = dir.StoragePoolInit()
 		if err != nil {
@@ -355,6 +378,17 @@ func storageInit(s *state.State, project, poolName, volumeName string, volumeTyp
 			return nil, err
 		}
 		return &ceph, nil
+	case storageTypeCephFs:
+		cephfs := storageCephFs{}
+		cephfs.poolID = poolID
+		cephfs.pool = pool
+		cephfs.volume = volume
+		cephfs.s = s
+		err = cephfs.StoragePoolInit()
+		if err != nil {
+			return nil, err
+		}
+		return &cephfs, nil
 	case storageTypeLvm:
 		lvm := storageLvm{}
 		lvm.poolID = poolID
@@ -421,70 +455,68 @@ func storagePoolVolumeAttachInit(s *state.State, poolName string, volumeName str
 		}
 	}
 
-	// Get the container's idmap
 	var nextIdmap *idmap.IdmapSet
-	if c.IsRunning() {
-		nextIdmap, err = c.CurrentIdmap()
-	} else {
-		nextIdmap, err = c.NextIdmap()
-	}
-	if err != nil {
-		return nil, err
-	}
-
 	nextJsonMap := "[]"
-	if nextIdmap != nil {
-		nextJsonMap, err = idmapsetToJSON(nextIdmap)
+	if !shared.IsTrue(poolVolumePut.Config["security.shifted"]) {
+		// Get the container's idmap
+		if c.IsRunning() {
+			nextIdmap, err = c.CurrentIdmap()
+		} else {
+			nextIdmap, err = c.NextIdmap()
+		}
 		if err != nil {
 			return nil, err
+		}
+
+		if nextIdmap != nil {
+			nextJsonMap, err = idmapsetToJSON(nextIdmap)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 	poolVolumePut.Config["volatile.idmap.next"] = nextJsonMap
 
 	// get mountpoint of storage volume
-	remapPath := getStoragePoolVolumeMountPoint(poolName, volumeName)
+	remapPath := driver.GetStoragePoolVolumeMountPoint(poolName, volumeName)
 
-	// Convert the volume type name to our internal integer representation.
-	volumeTypeName, err := storagePoolVolumeTypeToName(volumeType)
-	if err != nil {
-		return nil, err
-	}
-
-	if !reflect.DeepEqual(nextIdmap, lastIdmap) {
+	if !nextIdmap.Equals(lastIdmap) {
 		logger.Debugf("Shifting storage volume")
-		volumeUsedBy, err := storagePoolVolumeUsedByContainersGet(s,
-			"default", volumeName, volumeTypeName)
-		if err != nil {
-			return nil, err
-		}
 
-		if len(volumeUsedBy) > 1 {
-			for _, ctName := range volumeUsedBy {
-				ct, err := containerLoadByProjectAndName(s, c.Project(), ctName)
-				if err != nil {
-					continue
-				}
-
-				var ctNextIdmap *idmap.IdmapSet
-				if ct.IsRunning() {
-					ctNextIdmap, err = ct.CurrentIdmap()
-				} else {
-					ctNextIdmap, err = ct.NextIdmap()
-				}
-				if err != nil {
-					return nil, fmt.Errorf("Failed to retrieve idmap of container")
-				}
-
-				if !reflect.DeepEqual(nextIdmap, ctNextIdmap) {
-					return nil, fmt.Errorf("Idmaps of container %v and storage volume %v are not identical", ctNextIdmap, nextIdmap)
-				}
+		if !shared.IsTrue(poolVolumePut.Config["security.shifted"]) {
+			volumeUsedBy, err := storagePoolVolumeUsedByContainersGet(s, "default", poolName, volumeName)
+			if err != nil {
+				return nil, err
 			}
-		} else if len(volumeUsedBy) == 1 {
-			// If we're the only one who's attached that container
-			// we can shift the storage volume.
-			// I'm not sure if we want some locking here.
-			if volumeUsedBy[0] != c.Name() {
-				return nil, fmt.Errorf("idmaps of container and storage volume are not identical")
+
+			if len(volumeUsedBy) > 1 {
+				for _, ctName := range volumeUsedBy {
+					ct, err := containerLoadByProjectAndName(s, c.Project(), ctName)
+					if err != nil {
+						continue
+					}
+
+					var ctNextIdmap *idmap.IdmapSet
+					if ct.IsRunning() {
+						ctNextIdmap, err = ct.CurrentIdmap()
+					} else {
+						ctNextIdmap, err = ct.NextIdmap()
+					}
+					if err != nil {
+						return nil, fmt.Errorf("Failed to retrieve idmap of container")
+					}
+
+					if !nextIdmap.Equals(ctNextIdmap) {
+						return nil, fmt.Errorf("Idmaps of container %v and storage volume %v are not identical", ctName, volumeName)
+					}
+				}
+			} else if len(volumeUsedBy) == 1 {
+				// If we're the only one who's attached that container
+				// we can shift the storage volume.
+				// I'm not sure if we want some locking here.
+				if volumeUsedBy[0] != c.Name() {
+					return nil, fmt.Errorf("idmaps of container and storage volume are not identical")
+				}
 			}
 		}
 
@@ -586,70 +618,6 @@ func storagePoolVolumeContainerLoadInit(s *state.State, project, containerName s
 	return storagePoolVolumeInit(s, project, poolName, containerName, storagePoolVolumeTypeContainer)
 }
 
-// {LXD_DIR}/storage-pools/<pool>
-func getStoragePoolMountPoint(poolName string) string {
-	return shared.VarPath("storage-pools", poolName)
-}
-
-// ${LXD_DIR}/storage-pools/<pool>/containers/[<project_name>_]<container_name>
-func getContainerMountPoint(project string, poolName string, containerName string) string {
-	return shared.VarPath("storage-pools", poolName, "containers", projectPrefix(project, containerName))
-}
-
-// ${LXD_DIR}/storage-pools/<pool>/containers-snapshots/<snapshot_name>
-func getSnapshotMountPoint(project, poolName string, snapshotName string) string {
-	return shared.VarPath("storage-pools", poolName, "containers-snapshots", projectPrefix(project, snapshotName))
-}
-
-// ${LXD_DIR}/storage-pools/<pool>/images/<fingerprint>
-func getImageMountPoint(poolName string, fingerprint string) string {
-	return shared.VarPath("storage-pools", poolName, "images", fingerprint)
-}
-
-// ${LXD_DIR}/storage-pools/<pool>/custom/<storage_volume>
-func getStoragePoolVolumeMountPoint(poolName string, volumeName string) string {
-	return shared.VarPath("storage-pools", poolName, "custom", volumeName)
-}
-
-// ${LXD_DIR}/storage-pools/<pool>/custom-snapshots/<custom volume name>/<snapshot name>
-func getStoragePoolVolumeSnapshotMountPoint(poolName string, snapshotName string) string {
-	return shared.VarPath("storage-pools", poolName, "custom-snapshots", snapshotName)
-}
-
-func createContainerMountpoint(mountPoint string, mountPointSymlink string, privileged bool) error {
-	var mode os.FileMode
-	if privileged {
-		mode = 0700
-	} else {
-		mode = 0711
-	}
-
-	mntPointSymlinkExist := shared.PathExists(mountPointSymlink)
-	mntPointSymlinkTargetExist := shared.PathExists(mountPoint)
-
-	var err error
-	if !mntPointSymlinkTargetExist {
-		err = os.MkdirAll(mountPoint, 0711)
-		if err != nil {
-			return err
-		}
-	}
-
-	err = os.Chmod(mountPoint, mode)
-	if err != nil {
-		return err
-	}
-
-	if !mntPointSymlinkExist {
-		err := os.Symlink(mountPoint, mountPointSymlink)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
 func deleteContainerMountpoint(mountPoint string, mountPointSymlink string, storageTypeName string) error {
 	if shared.PathExists(mountPointSymlink) {
 		err := os.Remove(mountPointSymlink)
@@ -707,27 +675,6 @@ func renameContainerMountpoint(oldMountPoint string, oldMountPointSymlink string
 	return nil
 }
 
-func createSnapshotMountpoint(snapshotMountpoint string, snapshotsSymlinkTarget string, snapshotsSymlink string) error {
-	snapshotMntPointExists := shared.PathExists(snapshotMountpoint)
-	mntPointSymlinkExist := shared.PathExists(snapshotsSymlink)
-
-	if !snapshotMntPointExists {
-		err := os.MkdirAll(snapshotMountpoint, 0711)
-		if err != nil {
-			return err
-		}
-	}
-
-	if !mntPointSymlinkExist {
-		err := os.Symlink(snapshotsSymlinkTarget, snapshotsSymlink)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
 func deleteSnapshotMountpoint(snapshotMountpoint string, snapshotsSymlinkTarget string, snapshotsSymlink string) error {
 	if shared.PathExists(snapshotMountpoint) {
 		err := os.Remove(snapshotMountpoint)
@@ -764,7 +711,7 @@ func resetContainerDiskIdmap(container container, srcIdmap *idmap.IdmapSet) erro
 		dstIdmap = new(idmap.IdmapSet)
 	}
 
-	if !reflect.DeepEqual(srcIdmap, dstIdmap) {
+	if !srcIdmap.Equals(dstIdmap) {
 		var jsonIdmap string
 		if srcIdmap != nil {
 			idmapBytes, err := json.Marshal(srcIdmap.Idmap)
@@ -776,7 +723,7 @@ func resetContainerDiskIdmap(container container, srcIdmap *idmap.IdmapSet) erro
 			jsonIdmap = "[]"
 		}
 
-		err := container.ConfigKeySet("volatile.last_state.idmap", jsonIdmap)
+		err := container.VolatileSet(map[string]string{"volatile.last_state.idmap": jsonIdmap})
 		if err != nil {
 			return err
 		}
@@ -791,9 +738,9 @@ func progressWrapperRender(op *operation, key string, description string, progre
 		meta = make(map[string]interface{})
 	}
 
-	progress := fmt.Sprintf("%s (%s/s)", shared.GetByteSizeString(progressInt, 2), shared.GetByteSizeString(speedInt, 2))
+	progress := fmt.Sprintf("%s (%s/s)", units.GetByteSizeString(progressInt, 2), units.GetByteSizeString(speedInt, 2))
 	if description != "" {
-		progress = fmt.Sprintf("%s: %s (%s/s)", description, shared.GetByteSizeString(progressInt, 2), shared.GetByteSizeString(speedInt, 2))
+		progress = fmt.Sprintf("%s: %s (%s/s)", description, units.GetByteSizeString(progressInt, 2), units.GetByteSizeString(speedInt, 2))
 	}
 
 	if meta[key] != progress {
@@ -936,4 +883,71 @@ func storagePoolDriversCacheUpdate(cluster *db.Cluster) {
 	storagePoolDriversCacheLock.Unlock()
 
 	return
+}
+
+// storageVolumeMount initialises a new storage interface and checks the pool and volume are
+// mounted. If they are not then they are mounted.
+func storageVolumeMount(state *state.State, poolName string, volumeName string, volumeTypeName string, instance device.InstanceIdentifier) error {
+	c, ok := instance.(*containerLXC)
+	if !ok {
+		return fmt.Errorf("Received non-LXC container instance")
+	}
+
+	volumeType, _ := storagePoolVolumeTypeNameToType(volumeTypeName)
+	s, err := storagePoolVolumeAttachInit(state, poolName, volumeName, volumeType, c)
+	if err != nil {
+		return err
+	}
+
+	_, err = s.StoragePoolVolumeMount()
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// storageVolumeUmount unmounts a storage volume on a pool.
+func storageVolumeUmount(state *state.State, poolName string, volumeName string, volumeType int) error {
+	// Custom storage volumes do not currently support projects, so hardcode "default" project.
+	s, err := storagePoolVolumeInit(state, "default", poolName, volumeName, volumeType)
+	if err != nil {
+		return err
+	}
+
+	_, err = s.StoragePoolVolumeUmount()
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// storageRootFSApplyQuota applies a quota to an instance if it can, if it cannot then it will
+// return false indicating that the quota needs to be stored in volatile to be applied on next boot.
+func storageRootFSApplyQuota(instance device.InstanceIdentifier, newSizeBytes int64) (bool, error) {
+	c, ok := instance.(*containerLXC)
+	if !ok {
+		return false, fmt.Errorf("Received non-LXC container instance")
+	}
+
+	err := c.initStorage()
+	if err != nil {
+		return false, errors.Wrap(err, "Initialize storage")
+	}
+
+	storageTypeName := c.storage.GetStorageTypeName()
+	storageIsReady := c.storage.ContainerStorageReady(c)
+
+	// If we cannot apply the quota now, then return false as needs to be applied on next boot.
+	if (storageTypeName == "lvm" || storageTypeName == "ceph") && c.IsRunning() || !storageIsReady {
+		return false, nil
+	}
+
+	err = c.storage.StorageEntitySetQuota(storagePoolVolumeTypeContainer, newSizeBytes, c)
+	if err != nil {
+		return false, errors.Wrap(err, "Set storage quota")
+	}
+
+	return true, nil
 }
