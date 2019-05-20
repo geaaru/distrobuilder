@@ -162,7 +162,7 @@
     "pkg/system",
   ]
   pruneopts = "UT"
-  revision = "bc3826806c27c583af894b936d8894c47f730289"
+  revision = "77a42751d238f1d23320e25d1d1ae0d9c8ca5510"
 
 [[projects]]
   digest = "1:ade935c55cd6d0367c843b109b09c9d748b1982952031414740750fdf94747eb"
@@ -208,6 +208,14 @@
   pruneopts = "UT"
   revision = "0b6996fbacaa97246e47c8e29dc6cdf8639f19cf"
   version = "v1.4.0"
+
+[[projects]]
+  branch = "master"
+  digest = "1:948002dbf9ee54733c8f49df105f30ebefe1ee5ab4f5c98e0f8347ceff450caf"
+  name = "github.com/geaaru/docker-companion"
+  packages = ["api"]
+  pruneopts = "UT"
+  revision = "be094a3af2e2731a51ea52fb45af25cd607557a5"
 
 [[projects]]
   digest = "1:48092bf6632f55839850666c33469f546f6d45fdbd59a66759ec12e84d853dc2"
@@ -289,7 +297,7 @@
 
 [[projects]]
   branch = "master"
-  digest = "1:ca2fb1919ffe700ac2ce043e464ab29b454c997bcd40e9b08de2be3400645b55"
+  digest = "1:7fe3d518305ec97aeb46b5b5c7459dbc8b5535a8479a713a534542a748853425"
   name = "github.com/lxc/lxd"
   packages = [
     "shared",
@@ -299,16 +307,8 @@
     "shared/logger",
     "shared/osarch",
   ]
-  pruneopts = "T"
-  revision = "65c30131299926799dcc3c7a94967b0fdd062da0"
-
-[[projects]]
-  digest = "1:948002dbf9ee54733c8f49df105f30ebefe1ee5ab4f5c98e0f8347ceff450caf"
-  name = "github.com/mudler/docker-companion"
-  packages = ["api"]
   pruneopts = "UT"
-  revision = "6a693e9b9eaf2cd08ba628350613f2e08e9af57d"
-  version = "v0.4.5"
+  revision = "65c30131299926799dcc3c7a94967b0fdd062da0"
 
 [[projects]]
   digest = "1:0858a0639edda35828bf87916673f5a8e3c622fed8e81b9706205beb93cb660a"
@@ -360,15 +360,16 @@
   version = "v0.1.1"
 
 [[projects]]
-  digest = "1:57234a321bf1f8f98a8a9a5122a2404cc60d0800516f4ab7a7b2375e4b2d19ea"
+  branch = "master"
+  digest = "1:9b1faa0a95eb542ac3a4b769a26dd225e368128b9e6ea652fef9eadf8873fe2f"
   name = "github.com/opencontainers/runtime-spec"
   packages = ["specs-go"]
   pruneopts = "UT"
-  revision = "4e3b9264a330d094b0386c3703c5f379119711e8"
-  version = "v1.0.1"
+  revision = "5b71a03e2700cbb1091b78849b8748f5e1692650"
 
 [[projects]]
-  digest = "1:8e29919b351fc84fd71a1c8c6952db264490d270db419138f4534bc4bb09e9fc"
+  branch = "master"
+  digest = "1:1541feadd2e654b271f03937914f1d556387adaacf938237ace3c3b5d1b6413e"
   name = "github.com/opencontainers/runtime-tools"
   packages = [
     "error",
@@ -379,8 +380,18 @@
     "validate",
   ]
   pruneopts = "UT"
-  revision = "a4a33d4d2f6933bb8add5e1a6bf8f9374f09555b"
-  version = "v0.8.0"
+  revision = "095789df6c2bc53a9dd4464cda8c22616d66e0d6"
+
+[[projects]]
+  digest = "1:3e824b6fb758a8b021d30b613d84e7404d06d33c8f43f92baed633427836736c"
+  name = "github.com/opencontainers/selinux"
+  packages = [
+    "go-selinux",
+    "go-selinux/label",
+  ]
+  pruneopts = "UT"
+  revision = "3a1f366feb7aecbf7a0e71ac4cea88b31597de9e"
+  version = "v1.2.2"
 
 [[projects]]
   digest = "1:cf31692c14422fa27c83a05292eb5cbe0fb2775972e8f1f8446a71549bd8980b"
@@ -608,11 +619,11 @@
   analyzer-name = "dep"
   analyzer-version = 1
   input-imports = [
+    "github.com/geaaru/docker-companion/api",
     "github.com/lxc/lxd/shared",
     "github.com/lxc/lxd/shared/api",
     "github.com/lxc/lxd/shared/ioprogress",
     "github.com/lxc/lxd/shared/osarch",
-    "github.com/mudler/docker-companion/api",
     "github.com/spf13/cobra",
     "github.com/stretchr/testify/require",
     "gopkg.in/antchfx/htmlquery.v1",
