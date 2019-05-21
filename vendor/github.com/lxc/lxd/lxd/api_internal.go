@@ -29,11 +29,10 @@ import (
 	runtimeDebug "runtime/debug"
 )
 
-var apiInternal = []APIEndpoint{
+var apiInternal = []Command{
 	internalReadyCmd,
 	internalShutdownCmd,
 	internalContainerOnStartCmd,
-	internalContainerOnNetworkUpCmd,
 	internalContainerOnStopCmd,
 	internalContainersCmd,
 	internalSQLCmd,
@@ -45,59 +44,45 @@ var apiInternal = []APIEndpoint{
 	internalRAFTSnapshotCmd,
 }
 
-var internalShutdownCmd = APIEndpoint{
-	Name: "shutdown",
-
-	Put: APIEndpointAction{Handler: internalShutdown},
+var internalShutdownCmd = Command{
+	name: "shutdown",
+	put:  internalShutdown,
 }
 
-var internalReadyCmd = APIEndpoint{
-	Name: "ready",
-
-	Get: APIEndpointAction{Handler: internalWaitReady},
+var internalReadyCmd = Command{
+	name: "ready",
+	get:  internalWaitReady,
 }
 
-var internalContainerOnStartCmd = APIEndpoint{
-	Name: "containers/{id}/onstart",
-
-	Get: APIEndpointAction{Handler: internalContainerOnStart},
+var internalContainerOnStartCmd = Command{
+	name: "containers/{id}/onstart",
+	get:  internalContainerOnStart,
 }
 
-var internalContainerOnStopCmd = APIEndpoint{
-	Name: "containers/{id}/onstop",
-
-	Get: APIEndpointAction{Handler: internalContainerOnStop},
+var internalContainerOnStopCmd = Command{
+	name: "containers/{id}/onstop",
+	get:  internalContainerOnStop,
 }
 
-var internalContainerOnNetworkUpCmd = APIEndpoint{
-	Name: "containers/{id}/onnetwork-up",
-
-	Get: APIEndpointAction{Handler: internalContainerOnNetworkUp},
+var internalSQLCmd = Command{
+	name: "sql",
+	get:  internalSQLGet,
+	post: internalSQLPost,
 }
 
-var internalSQLCmd = APIEndpoint{
-	Name: "sql",
-
-	Get:  APIEndpointAction{Handler: internalSQLGet},
-	Post: APIEndpointAction{Handler: internalSQLPost},
+var internalContainersCmd = Command{
+	name: "containers",
+	post: internalImport,
 }
 
-var internalContainersCmd = APIEndpoint{
-	Name: "containers",
-
-	Post: APIEndpointAction{Handler: internalImport},
+var internalGarbageCollectorCmd = Command{
+	name: "gc",
+	get:  internalGC,
 }
 
-var internalGarbageCollectorCmd = APIEndpoint{
-	Name: "gc",
-
-	Get: APIEndpointAction{Handler: internalGC},
-}
-
-var internalRAFTSnapshotCmd = APIEndpoint{
-	Name: "raft-snapshot",
-
-	Get: APIEndpointAction{Handler: internalRAFTSnapshot},
+var internalRAFTSnapshotCmd = Command{
+	name: "raft-snapshot",
+	get:  internalRAFTSnapshot,
 }
 
 func internalWaitReady(d *Daemon, r *http.Request) Response {
@@ -155,26 +140,6 @@ func internalContainerOnStop(d *Daemon, r *http.Request) Response {
 	err = c.OnStop(target)
 	if err != nil {
 		logger.Error("The stop hook failed", log.Ctx{"container": c.Name(), "err": err})
-		return SmartError(err)
-	}
-
-	return EmptySyncResponse
-}
-
-func internalContainerOnNetworkUp(d *Daemon, r *http.Request) Response {
-	id, err := strconv.Atoi(mux.Vars(r)["id"])
-	if err != nil {
-		return SmartError(err)
-	}
-
-	c, err := containerLoadById(d.State(), id)
-	if err != nil {
-		return SmartError(err)
-	}
-
-	err = c.OnNetworkUp(queryParam(r, "device"), queryParam(r, "host_name"))
-	if err != nil {
-		logger.Error("The network up script failed", log.Ctx{"container": c.Name(), "err": err})
 		return SmartError(err)
 	}
 

@@ -10,7 +10,6 @@ import (
 	"github.com/lxc/lxd/lxd/migration"
 	"github.com/lxc/lxd/lxd/types"
 	"github.com/lxc/lxd/shared"
-	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/logger"
 )
 
@@ -37,7 +36,7 @@ type MigrationStorageSourceDriver interface {
 	 */
 	Cleanup()
 
-	SendStorageVolume(conn *websocket.Conn, op *operation, bwlimit string, storage storage, volumeOnly bool) error
+	SendStorageVolume(conn *websocket.Conn, op *operation, bwlimit string, storage storage) error
 }
 
 type rsyncStorageSourceDriver struct {
@@ -50,7 +49,7 @@ func (s rsyncStorageSourceDriver) Snapshots() []container {
 	return s.snapshots
 }
 
-func (s rsyncStorageSourceDriver) SendStorageVolume(conn *websocket.Conn, op *operation, bwlimit string, storage storage, volumeOnly bool) error {
+func (s rsyncStorageSourceDriver) SendStorageVolume(conn *websocket.Conn, op *operation, bwlimit string, storage storage) error {
 	ourMount, err := storage.StoragePoolVolumeMount()
 	if err != nil {
 		return err
@@ -59,39 +58,15 @@ func (s rsyncStorageSourceDriver) SendStorageVolume(conn *websocket.Conn, op *op
 		defer storage.StoragePoolVolumeUmount()
 	}
 
-	state := storage.GetState()
 	pool := storage.GetStoragePool()
 	volume := storage.GetStoragePoolVolume()
 
-	if !volumeOnly {
-		snapshots, err := storagePoolVolumeSnapshotsGet(state, pool.Name, volume.Name, storagePoolVolumeTypeCustom)
-		if err != nil {
-			return err
-		}
-
-		for _, snap := range snapshots {
-			wrapper := StorageProgressReader(op, "fs_progress", snap)
-			path := getStoragePoolVolumeSnapshotMountPoint(pool.Name, snap)
-			path = shared.AddSlash(path)
-			logger.Debugf("Starting to send storage volume snapshot %s on storage pool %s from %s", snap, pool.Name, path)
-
-			err = RsyncSend(volume.Name, path, conn, wrapper, s.rsyncFeatures, bwlimit, state.OS.ExecPath)
-			if err != nil {
-				return err
-			}
-		}
-	}
-
 	wrapper := StorageProgressReader(op, "fs_progress", volume.Name)
+	state := storage.GetState()
 	path := getStoragePoolVolumeMountPoint(pool.Name, volume.Name)
 	path = shared.AddSlash(path)
 	logger.Debugf("Starting to send storage volume %s on storage pool %s from %s", volume.Name, pool.Name, path)
-	err = RsyncSend(volume.Name, path, conn, wrapper, s.rsyncFeatures, bwlimit, state.OS.ExecPath)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return RsyncSend(volume.Name, path, conn, wrapper, s.rsyncFeatures, bwlimit, state.OS.ExecPath)
 }
 
 func (s rsyncStorageSourceDriver) SendWhileRunning(conn *websocket.Conn, op *operation, bwlimit string, containerOnly bool) error {
@@ -239,43 +214,6 @@ func rsyncStorageMigrationSink(conn *websocket.Conn, op *operation, args Migrati
 
 	pool := args.Storage.GetStoragePool()
 	volume := args.Storage.GetStoragePoolVolume()
-
-	if !args.VolumeOnly {
-		for _, snap := range args.Snapshots {
-			target := api.StorageVolumeSnapshotsPost{
-				Name: fmt.Sprintf("%s/%s", volume.Name, *snap.Name),
-			}
-
-			dbArgs := &db.StorageVolumeArgs{
-				Name:        fmt.Sprintf("%s/%s", volume.Name, *snap.Name),
-				PoolName:    pool.Name,
-				TypeName:    volume.Type,
-				Snapshot:    true,
-				Config:      volume.Config,
-				Description: volume.Description,
-			}
-
-			_, err = storagePoolVolumeSnapshotDBCreateInternal(args.Storage.GetState(), dbArgs)
-			if err != nil {
-				return err
-			}
-
-			wrapper := StorageProgressWriter(op, "fs_progress", target.Name)
-			path := getStoragePoolVolumeMountPoint(pool.Name, volume.Name)
-			path = shared.AddSlash(path)
-			logger.Debugf("Starting to receive storage volume snapshot %s on storage pool %s into %s", target.Name, pool.Name, path)
-
-			err = RsyncRecv(path, conn, wrapper, args.RsyncFeatures)
-			if err != nil {
-				return err
-			}
-
-			err = args.Storage.StoragePoolVolumeSnapshotCreate(&target)
-			if err != nil {
-				return err
-			}
-		}
-	}
 
 	wrapper := StorageProgressWriter(op, "fs_progress", volume.Name)
 	path := getStoragePoolVolumeMountPoint(pool.Name, volume.Name)

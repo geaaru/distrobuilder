@@ -1,6 +1,6 @@
 /*
  * umoci: Umoci Modifies Open Containers' Images
- * Copyright (C) 2016, 2017 SUSE LLC.
+ * Copyright (C) 2016, 2017, 2018 SUSE LLC.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,18 +19,16 @@ package layer
 
 import (
 	"io"
+	"os"
+	"path"
 	"path/filepath"
 	"sort"
 
 	"github.com/apex/log"
+	"github.com/openSUSE/umoci/pkg/unpriv"
 	"github.com/pkg/errors"
 	"github.com/vbatts/go-mtree"
 )
-
-// NOTE: This currently requires a version of go-mtree which has my Compare()
-//       PR added. While we don't use this interface here, my work also
-//       implemented the InodeDelta and supporting interfaces. Hopefully my PR
-//       will be merged soon. https://github.com/vbatts/go-mtree/pull/48
 
 // inodeDeltas is a wrapper around []mtree.InodeDelta that allows for sorting
 // the set of deltas by the pathname.
@@ -56,7 +54,8 @@ func GenerateLayer(path string, deltas []mtree.InodeDelta, opt *MapOptions) (io.
 	go func() (Err error) {
 		// Close with the returned error.
 		defer func() {
-			writer.CloseWithError(errors.Wrap(Err, "generate layer"))
+			// #nosec G104
+			_ = writer.CloseWithError(errors.Wrap(Err, "generate layer"))
 		}()
 
 		// We can't just dump all of the file contents into a tar file. We need
@@ -101,4 +100,45 @@ func GenerateLayer(path string, deltas []mtree.InodeDelta, opt *MapOptions) (io.
 	}()
 
 	return reader, nil
+}
+
+// GenerateInsertLayer generates a completely new layer from "root"to be
+// inserted into the image at "target". If "root" is an empty string then the
+// "target" will be removed via a whiteout.
+func GenerateInsertLayer(root string, target string, opaque bool, opt *MapOptions) io.ReadCloser {
+	root = CleanPath(root)
+
+	var mapOptions MapOptions
+	if opt != nil {
+		mapOptions = *opt
+	}
+
+	reader, writer := io.Pipe()
+
+	go func() (Err error) {
+		defer func() {
+			// #nosec G104
+			_ = writer.CloseWithError(errors.Wrap(Err, "generate layer"))
+		}()
+
+		tg := newTarGenerator(writer, mapOptions)
+
+		if opaque {
+			if err := tg.AddOpaqueWhiteout(target); err != nil {
+				return err
+			}
+		}
+		if root == "" {
+			return tg.AddWhiteout(target)
+		}
+		return unpriv.Walk(root, func(curPath string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+
+			pathInTar := path.Join(target, curPath[len(root):])
+			return tg.AddFile(pathInTar, curPath)
+		})
+	}()
+	return reader
 }

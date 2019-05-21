@@ -34,33 +34,29 @@ import (
 // Lock to prevent concurent networks creation
 var networkCreateLock sync.Mutex
 
-var networksCmd = APIEndpoint{
-	Name: "networks",
-
-	Get:  APIEndpointAction{Handler: networksGet, AccessHandler: AllowAuthenticated},
-	Post: APIEndpointAction{Handler: networksPost},
+var networksCmd = Command{
+	name: "networks",
+	get:  networksGet,
+	post: networksPost,
 }
 
-var networkCmd = APIEndpoint{
-	Name: "networks/{name}",
-
-	Delete: APIEndpointAction{Handler: networkDelete},
-	Get:    APIEndpointAction{Handler: networkGet, AccessHandler: AllowAuthenticated},
-	Patch:  APIEndpointAction{Handler: networkPatch},
-	Post:   APIEndpointAction{Handler: networkPost},
-	Put:    APIEndpointAction{Handler: networkPut},
+var networkCmd = Command{
+	name:   "networks/{name}",
+	get:    networkGet,
+	delete: networkDelete,
+	post:   networkPost,
+	put:    networkPut,
+	patch:  networkPatch,
 }
 
-var networkLeasesCmd = APIEndpoint{
-	Name: "networks/{name}/leases",
-
-	Get: APIEndpointAction{Handler: networkLeasesGet, AccessHandler: AllowAuthenticated},
+var networkLeasesCmd = Command{
+	name: "networks/{name}/leases",
+	get:  networkLeasesGet,
 }
 
-var networkStateCmd = APIEndpoint{
-	Name: "networks/{name}/state",
-
-	Get: APIEndpointAction{Handler: networkStateGet, AccessHandler: AllowAuthenticated},
+var networkStateCmd = Command{
+	name: "networks/{name}/state",
+	get:  networkStateGet,
 }
 
 // API endpoints
@@ -665,7 +661,6 @@ func doNetworkUpdate(d *Daemon, name string, oldConfig map[string]string, req ap
 
 func networkLeasesGet(d *Daemon, r *http.Request) Response {
 	name := mux.Vars(r)["name"]
-	project := projectParam(r)
 
 	// Try to get the network
 	n, err := doNetworkGet(d, name)
@@ -679,12 +674,11 @@ func networkLeasesGet(d *Daemon, r *http.Request) Response {
 	}
 
 	leases := []api.NetworkLease{}
-	projectMacs := []string{}
 
 	// Get all static leases
 	if !isClusterNotification(r) {
 		// Get all the containers
-		containers, err := containerLoadByProject(d.State(), project)
+		containers, err := containerLoadFromAllProjects(d.State())
 		if err != nil {
 			return SmartError(err)
 		}
@@ -701,11 +695,6 @@ func networkLeasesGet(d *Daemon, r *http.Request) Response {
 				d, err = c.(*containerLXC).fillNetworkDevice(k, d)
 				if err != nil {
 					continue
-				}
-
-				// Record the MAC
-				if d["hwaddr"] != "" {
-					projectMacs = append(projectMacs, d["hwaddr"])
 				}
 
 				// Add the lease
@@ -807,18 +796,6 @@ func networkLeasesGet(d *Daemon, r *http.Request) Response {
 		if err != nil {
 			return SmartError(err)
 		}
-
-		// Filter based on project
-		filteredLeases := []api.NetworkLease{}
-		for _, lease := range leases {
-			if !shared.StringInSlice(lease.Hwaddr, projectMacs) {
-				continue
-			}
-
-			filteredLeases = append(filteredLeases, lease)
-		}
-
-		leases = filteredLeases
 	}
 
 	return SyncResponse(true, leases)
@@ -1299,19 +1276,13 @@ func (n *network) Start() error {
 
 		// Configure NAT
 		if shared.IsTrue(n.config["ipv4.nat"]) {
-			//If a SNAT source address is specified, use that, otherwise default to using MASQUERADE mode.
-			args := []string{"-s", subnet.String(), "!", "-d", subnet.String(), "-j", "MASQUERADE"}
-			if n.config["ipv4.nat.address"] != "" {
-				args = []string{"-s", subnet.String(), "!", "-d", subnet.String(), "-j", "SNAT", "--to", n.config["ipv4.nat.address"]}
-			}
-
 			if n.config["ipv4.nat.order"] == "after" {
-				err = networkIptablesAppend("ipv4", n.name, "nat", "POSTROUTING", args...)
+				err = networkIptablesAppend("ipv4", n.name, "nat", "POSTROUTING", "-s", subnet.String(), "!", "-d", subnet.String(), "-j", "MASQUERADE")
 				if err != nil {
 					return err
 				}
 			} else {
-				err = networkIptablesPrepend("ipv4", n.name, "nat", "POSTROUTING", args...)
+				err = networkIptablesPrepend("ipv4", n.name, "nat", "POSTROUTING", "-s", subnet.String(), "!", "-d", subnet.String(), "-j", "MASQUERADE")
 				if err != nil {
 					return err
 				}
@@ -1474,18 +1445,13 @@ func (n *network) Start() error {
 
 		// Configure NAT
 		if shared.IsTrue(n.config["ipv6.nat"]) {
-			args := []string{"-s", subnet.String(), "!", "-d", subnet.String(), "-j", "MASQUERADE"}
-			if n.config["ipv6.nat.address"] != "" {
-				args = []string{"-s", subnet.String(), "!", "-d", subnet.String(), "-j", "SNAT", "--to", n.config["ipv6.nat.address"]}
-			}
-
 			if n.config["ipv6.nat.order"] == "after" {
-				err = networkIptablesAppend("ipv6", n.name, "nat", "POSTROUTING", args...)
+				err = networkIptablesAppend("ipv6", n.name, "nat", "POSTROUTING", "-s", subnet.String(), "!", "-d", subnet.String(), "-j", "MASQUERADE")
 				if err != nil {
 					return err
 				}
 			} else {
-				err = networkIptablesPrepend("ipv6", n.name, "nat", "POSTROUTING", args...)
+				err = networkIptablesPrepend("ipv6", n.name, "nat", "POSTROUTING", "-s", subnet.String(), "!", "-d", subnet.String(), "-j", "MASQUERADE")
 				if err != nil {
 					return err
 				}

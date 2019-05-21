@@ -111,7 +111,7 @@ func networkIsInUse(c container, name string) bool {
 			continue
 		}
 
-		if !shared.StringInSlice(d["nictype"], []string{"bridged", "macvlan", "ipvlan", "physical", "sriov"}) {
+		if !shared.StringInSlice(d["nictype"], []string{"bridged", "macvlan", "physical", "sriov"}) {
 			continue
 		}
 
@@ -591,28 +591,6 @@ func networkValidAddressV6(value string) error {
 	return nil
 }
 
-func networkValidAddressV4List(value string) error {
-	for _, v := range strings.Split(value, ",") {
-		v = strings.TrimSpace(v)
-		err := networkValidAddressV4(v)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func networkValidAddressV6List(value string) error {
-	for _, v := range strings.Split(value, ",") {
-		v = strings.TrimSpace(v)
-		err := networkValidAddressV6(v)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func networkValidNetworkV4(value string) error {
 	if value == "" {
 		return nil
@@ -629,27 +607,6 @@ func networkValidNetworkV4(value string) error {
 
 	if ip.String() != subnet.IP.String() {
 		return fmt.Errorf("Not an IPv4 network address: %s", value)
-	}
-
-	return nil
-}
-
-func networkValidNetworkV6(value string) error {
-	if value == "" {
-		return nil
-	}
-
-	ip, subnet, err := net.ParseCIDR(value)
-	if err != nil {
-		return err
-	}
-
-	if ip == nil || ip.To4() != nil {
-		return fmt.Errorf("Not an IPv6 network: %s", value)
-	}
-
-	if ip.String() != subnet.IP.String() {
-		return fmt.Errorf("Not an IPv6 network address: %s", value)
 	}
 
 	return nil
@@ -918,7 +875,7 @@ func networkUpdateStatic(s *state.State, networkName string) error {
 				entries[d["parent"]] = [][]string{}
 			}
 
-			entries[d["parent"]] = append(entries[d["parent"]], []string{d["hwaddr"], c.Project(), c.Name(), d["ipv4.address"], d["ipv6.address"]})
+			entries[d["parent"]] = append(entries[d["parent"]], []string{d["hwaddr"], projectPrefix(c.Project(), c.Name()), d["ipv4.address"], d["ipv6.address"]})
 		}
 	}
 
@@ -953,37 +910,36 @@ func networkUpdateStatic(s *state.State, networkName string) error {
 		// Apply the changes
 		for entryIdx, entry := range entries {
 			hwaddr := entry[0]
-			project := entry[1]
-			cName := entry[2]
-			ipv4Address := entry[3]
-			ipv6Address := entry[4]
+			cName := entry[1]
+			ipv4Address := entry[2]
+			ipv6Address := entry[3]
 			line := hwaddr
 
 			// Look for duplicates
 			duplicate := false
 			for iIdx, i := range entries {
-				if projectPrefix(entry[1], entry[2]) == projectPrefix(i[1], i[2]) {
+				if entry[1] == i[1] {
 					// Skip ourselves
 					continue
 				}
 
 				if entry[0] == i[0] {
 					// Find broken configurations
-					logger.Errorf("Duplicate MAC detected: %s and %s", projectPrefix(entry[1], entry[2]), projectPrefix(i[1], i[2]))
+					logger.Errorf("Duplicate MAC detected: %s and %s", entry[1], i[1])
 				}
 
-				if i[3] == "" && i[4] == "" {
+				if i[2] == "" && i[3] == "" {
 					// Skip unconfigured
 					continue
 				}
 
-				if entry[3] == i[3] && entry[4] == i[4] {
+				if entry[2] == i[2] && entry[3] == i[3] {
 					// Find identical containers (copies with static configuration)
 					if entryIdx > iIdx {
 						duplicate = true
 					} else {
 						line = fmt.Sprintf("%s,%s", line, i[0])
-						logger.Debugf("Found containers with duplicate IPv4/IPv6: %s and %s", projectPrefix(entry[1], entry[2]), projectPrefix(i[1], i[2]))
+						logger.Debugf("Found containers with duplicate IPv4/IPv6: %s and %s", entry[1], i[1])
 					}
 				}
 			}
@@ -1009,7 +965,7 @@ func networkUpdateStatic(s *state.State, networkName string) error {
 				continue
 			}
 
-			err := ioutil.WriteFile(shared.VarPath("networks", network, "dnsmasq.hosts", projectPrefix(project, cName)), []byte(line+"\n"), 0644)
+			err := ioutil.WriteFile(shared.VarPath("networks", network, "dnsmasq.hosts", cName), []byte(line+"\n"), 0644)
 			if err != nil {
 				return err
 			}
@@ -1081,12 +1037,7 @@ func networkClearLease(s *state.State, name string, network string, hwaddr strin
 	if err != nil {
 		return err
 	}
-	defer func() {
-		err := n.Start()
-		if err != nil {
-			logger.Errorf("Failed to reload network '%s': %v", network, err)
-		}
-	}()
+	defer n.Start()
 
 	// Stop dnsmasq
 	err = networkKillDnsmasq(network, false)

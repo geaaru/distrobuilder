@@ -1,6 +1,6 @@
 /*
  * umoci: Umoci Modifies Open Containers' Images
- * Copyright (C) 2016, 2017 SUSE LLC.
+ * Copyright (C) 2016, 2017, 2018 SUSE LLC.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,9 +20,9 @@ package fseval
 import (
 	"io"
 	"os"
+	"path/filepath"
 	"time"
 
-	"github.com/openSUSE/umoci/pkg/system"
 	"github.com/openSUSE/umoci/pkg/unpriv"
 	"github.com/vbatts/go-mtree"
 	"golang.org/x/sys/unix"
@@ -103,7 +103,7 @@ func (fs unprivFsEval) Mkdir(path string, perm os.FileMode) error {
 }
 
 // Mknod is equivalent to unpriv.Mknod.
-func (fs unprivFsEval) Mknod(path string, mode os.FileMode, dev system.Dev_t) error {
+func (fs unprivFsEval) Mknod(path string, mode os.FileMode, dev uint64) error {
 	return unpriv.Mknod(path, mode, dev)
 }
 
@@ -133,8 +133,8 @@ func (fs unprivFsEval) Lgetxattr(path string, name string) ([]byte, error) {
 }
 
 // Lclearxattrs is equivalent to unpriv.Lclearxattrs
-func (fs unprivFsEval) Lclearxattrs(path string) error {
-	return unpriv.Lclearxattrs(path)
+func (fs unprivFsEval) Lclearxattrs(path string, except map[string]struct{}) error {
+	return unpriv.Lclearxattrs(path, except)
 }
 
 // KeywordFunc returns a wrapper around the given mtree.KeywordFunc.
@@ -148,4 +148,9 @@ func (fs unprivFsEval) KeywordFunc(fn mtree.KeywordFunc) mtree.KeywordFunc {
 		})
 		return kv, err
 	}
+}
+
+// Walk is equivalent to filepath.Walk.
+func (fs unprivFsEval) Walk(root string, fn filepath.WalkFunc) error {
+	return unpriv.Walk(root, fn)
 }

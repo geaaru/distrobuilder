@@ -92,8 +92,6 @@ func containerValidConfigKey(os *sys.OS, key string, value string) error {
 }
 
 var containerNetworkLimitKeys = []string{"limits.max", "limits.ingress", "limits.egress"}
-var containerNetworkRouteKeys = []string{"ipv4.routes", "ipv6.routes"}
-var containerNetworkKeys = append(containerNetworkLimitKeys, containerNetworkRouteKeys...)
 
 func containerValidDeviceConfigKey(t, k string) bool {
 	if k == "type" {
@@ -147,10 +145,6 @@ func containerValidDeviceConfigKey(t, k string) bool {
 		case "ipv4.address":
 			return true
 		case "ipv6.address":
-			return true
-		case "ipv4.routes":
-			return true
-		case "ipv6.routes":
 			return true
 		case "security.mac_filtering":
 			return true
@@ -369,67 +363,25 @@ func containerValidDevices(cluster *db.Cluster, devices types.Devices, profile b
 				return fmt.Errorf("Missing nic type")
 			}
 
-			if !shared.StringInSlice(m["nictype"], []string{"bridged", "macvlan", "ipvlan", "p2p", "physical", "sriov"}) {
+			if !shared.StringInSlice(m["nictype"], []string{"bridged", "macvlan", "p2p", "physical", "sriov"}) {
 				return fmt.Errorf("Bad nic type: %s", m["nictype"])
 			}
 
-			if shared.StringInSlice(m["nictype"], []string{"bridged", "macvlan", "ipvlan", "physical", "sriov"}) && m["parent"] == "" {
+			if shared.StringInSlice(m["nictype"], []string{"bridged", "macvlan", "physical", "sriov"}) && m["parent"] == "" {
 				return fmt.Errorf("Missing parent for %s type nic", m["nictype"])
 			}
 
 			if m["ipv4.address"] != "" {
-				if m["nictype"] == "ipvlan" {
-					err := networkValidAddressV4List(m["ipv4.address"])
-					if err != nil {
-						return err
-					}
-				} else {
-					err := networkValidAddressV4(m["ipv4.address"])
-					if err != nil {
-						return err
-					}
+				err := networkValidAddressV4(m["ipv4.address"])
+				if err != nil {
+					return err
 				}
 			}
 
 			if m["ipv6.address"] != "" {
-				if m["nictype"] == "ipvlan" {
-					err := networkValidAddressV6List(m["ipv6.address"])
-					if err != nil {
-						return err
-					}
-				} else {
-					err := networkValidAddressV6(m["ipv6.address"])
-					if err != nil {
-						return err
-					}
-				}
-			}
-
-			if m["ipv4.routes"] != "" {
-				if !shared.StringInSlice(m["nictype"], []string{"bridged", "p2p"}) {
-					return fmt.Errorf("Bad nic type for ipv4.routes: %s", m["nictype"])
-				}
-
-				for _, route := range strings.Split(m["ipv4.routes"], ",") {
-					route = strings.TrimSpace(route)
-					err := networkValidNetworkV4(route)
-					if err != nil {
-						return err
-					}
-				}
-			}
-
-			if m["ipv6.routes"] != "" {
-				if !shared.StringInSlice(m["nictype"], []string{"bridged", "p2p"}) {
-					return fmt.Errorf("Bad nic type for ipv6.routes: %s", m["nictype"])
-				}
-
-				for _, route := range strings.Split(m["ipv6.routes"], ",") {
-					route = strings.TrimSpace(route)
-					err := networkValidNetworkV6(route)
-					if err != nil {
-						return err
-					}
+				err := networkValidAddressV6(m["ipv6.address"])
+				if err != nil {
+					return err
 				}
 			}
 		} else if m["type"] == "infiniband" {
@@ -554,12 +506,12 @@ func containerValidDevices(cluster *db.Cluster, devices types.Devices, profile b
 				return fmt.Errorf("Proxy device entry is missing the required \"connect\" property")
 			}
 
-			listenAddr, err := proxyParseAddr(m["listen"])
+			listenAddr, err := parseAddr(m["listen"])
 			if err != nil {
 				return err
 			}
 
-			connectAddr, err := proxyParseAddr(m["connect"])
+			connectAddr, err := parseAddr(m["connect"])
 			if err != nil {
 				return err
 			}
@@ -637,7 +589,7 @@ type container interface {
 	// Live configuration
 	CGroupGet(key string) (string, error)
 	CGroupSet(key string, value string) error
-	VolatileSet(changes map[string]string) error
+	ConfigKeySet(key string, value string) error
 
 	// File handling
 	FileExists(path string) error
@@ -682,7 +634,6 @@ type container interface {
 	// Hooks
 	OnStart() error
 	OnStop(target string) error
-	OnNetworkUp(deviceName string, hostVeth string) error
 
 	// Properties
 	Id() int
@@ -1136,14 +1087,13 @@ func containerCreateAsSnapshot(s *state.State, args db.ContainerArgs, sourceCont
 		return nil, err
 	}
 
-	// Attempt to update backup.yaml on container
-	ourStart, err := sourceContainer.StorageStart()
+	ourStart, err := c.StorageStart()
 	if err != nil {
 		c.Delete()
 		return nil, err
 	}
 	if ourStart {
-		defer sourceContainer.StorageStop()
+		defer c.StorageStop()
 	}
 
 	err = writeBackupFile(sourceContainer)
@@ -1349,7 +1299,7 @@ func containerConfigureInternal(c container) error {
 	if rootDiskDevice["size"] != "" {
 		storageTypeName := storage.GetStorageTypeName()
 		if (storageTypeName == "lvm" || storageTypeName == "ceph") && c.IsRunning() {
-			err = c.VolatileSet(map[string]string{"volatile.apply_quota": rootDiskDevice["size"]})
+			err = c.ConfigKeySet("volatile.apply_quota", rootDiskDevice["size"])
 			if err != nil {
 				return err
 			}
@@ -1621,7 +1571,7 @@ func autoCreateContainerSnapshotsTask(d *Daemon) (task.Func, task.Schedule) {
 		// Figure out which need snapshotting (if any)
 		containers := []container{}
 		for _, c := range allContainers {
-			schedule := c.ExpandedConfig()["snapshots.schedule"]
+			schedule := c.LocalConfig()["snapshots.schedule"]
 
 			if schedule == "" {
 				continue
@@ -1635,18 +1585,10 @@ func autoCreateContainerSnapshotsTask(d *Daemon) (task.Func, task.Schedule) {
 
 			// Check if it's time to snapshot
 			now := time.Now()
-
-			// Truncate the time now back to the start of the minute, before passing to
-			// the cron scheduler, as it will add 1s to the scheduled time and we don't
-			// want the next scheduled time to roll over to the next minute and break
-			// the time comparison below.
-			now = now.Truncate(time.Minute)
-
-			// Calculate the next scheduled time based on the snapshots.schedule
-			// pattern and the time now.
 			next := sched.Next(now)
 
 			// Ignore everything that is more precise than minutes.
+			now = now.Truncate(time.Minute)
 			next = next.Truncate(time.Minute)
 
 			if !now.Equal(next) {
@@ -1654,7 +1596,7 @@ func autoCreateContainerSnapshotsTask(d *Daemon) (task.Func, task.Schedule) {
 			}
 
 			// Check if the container is running
-			if !shared.IsTrue(c.ExpandedConfig()["snapshots.schedule.stopped"]) && !c.IsRunning() {
+			if !shared.IsTrue(c.LocalConfig()["snapshots.schedule.stopped"]) && !c.IsRunning() {
 				continue
 			}
 
@@ -1714,7 +1656,7 @@ func autoCreateContainerSnapshots(ctx context.Context, d *Daemon, containers []c
 
 			snapshotName = fmt.Sprintf("%s%s%s", c.Name(), shared.SnapshotDelimiter, snapshotName)
 
-			expiry, err := shared.GetSnapshotExpiry(time.Now(), c.ExpandedConfig()["snapshots.expiry"])
+			expiry, err := shared.GetSnapshotExpiry(time.Now(), c.LocalConfig()["snapshots.expiry"])
 			if err != nil {
 				logger.Error("Error getting expiry date", log.Ctx{"err": err, "container": c})
 				ch <- nil
@@ -1835,7 +1777,7 @@ func pruneExpiredContainerSnapshots(ctx context.Context, d *Daemon, snapshots []
 func containerDetermineNextSnapshotName(d *Daemon, c container, defaultPattern string) (string, error) {
 	var err error
 
-	pattern := c.ExpandedConfig()["snapshots.pattern"]
+	pattern := c.LocalConfig()["snapshots.pattern"]
 	if pattern == "" {
 		pattern = defaultPattern
 	}

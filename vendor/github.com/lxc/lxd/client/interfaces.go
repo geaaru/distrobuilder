@@ -239,7 +239,6 @@ type ConnectionInfo struct {
 	Certificate string
 	Protocol    string
 	URL         string
-	SocketPath  string
 	Project     string
 }
 

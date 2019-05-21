@@ -740,13 +740,6 @@ func (s *storageCeph) copyWithoutSnapshotsFull(target container,
 		return err
 	}
 
-	// Re-generate the UUID
-	err = s.cephRBDGenerateUUID(projectPrefix(target.Project(), target.Name()), storagePoolVolumeTypeNameContainer)
-	if err != nil {
-		return err
-	}
-
-	// Create mountpoint
 	targetContainerMountPoint := getContainerMountPoint(target.Project(), s.pool.Name, target.Name())
 	err = createContainerMountpoint(targetContainerMountPoint, target.Path(), target.IsPrivileged())
 	if err != nil {
@@ -821,13 +814,23 @@ func (s *storageCeph) copyWithoutSnapshotsSparse(target container,
 		return err
 	}
 
-	// Re-generate the UUID
-	err = s.cephRBDGenerateUUID(projectPrefix(target.Project(), target.Name()), storagePoolVolumeTypeNameContainer)
+	RBDDevPath, err := cephRBDVolumeMap(s.ClusterName, s.OSDPoolName,
+		targetContainerName, storagePoolVolumeTypeNameContainer,
+		s.UserName)
 	if err != nil {
+		logger.Errorf(`Failed to map RBD storage volume for image "%s" on storage pool "%s": %s`, targetContainerName,
+			s.pool.Name, err)
 		return err
 	}
 
-	// Create mountpoint
+	// Generate a new xfs's UUID
+	RBDFilesystem := s.getRBDFilesystem()
+	msg, err := fsGenerateNewUUID(RBDFilesystem, RBDDevPath)
+	if err != nil {
+		logger.Errorf("Failed to create new \"%s\" UUID for container \"%s\" on storage pool \"%s\": %s", RBDFilesystem, targetContainerName, s.pool.Name, msg)
+		return err
+	}
+
 	targetContainerMountPoint := getContainerMountPoint(target.Project(), s.pool.Name, target.Name())
 	err = createContainerMountpoint(targetContainerMountPoint, target.Path(), target.IsPrivileged())
 	if err != nil {
@@ -1966,14 +1969,30 @@ func (s *storageCeph) copyVolumeWithoutSnapshotsFull(source *api.StorageVolumeSo
 		return err
 	}
 
-	// Re-generate the UUID
-	err = s.cephRBDGenerateUUID(s.volume.Name, storagePoolVolumeTypeNameCustom)
+	// Map the rbd
+	RBDDevPath, err := cephRBDVolumeMap(s.ClusterName, s.OSDPoolName, s.volume.Name, storagePoolVolumeTypeNameCustom, s.UserName)
 	if err != nil {
+		logger.Errorf("Failed to map RBD storage volume \"%s\" on storage pool \"%s\": %s", s.volume.Name, s.pool.Name, err)
 		return err
 	}
 
-	// Create the mountpoint
+	// Generate a new UUID
+	RBDFilesystem := s.getRBDFilesystem()
+	msg, err := fsGenerateNewUUID(RBDFilesystem, RBDDevPath)
+	if err != nil {
+		logger.Errorf("Failed to create new UUID for filesystem \"%s\" for RBD storage volume \"%s\" on storage pool \"%s\": %s: %s", RBDFilesystem, s.volume.Name, s.pool.Name, msg, err)
+		return err
+	}
+
+	// Unmap the rbd
+	err = cephRBDVolumeUnmap(s.ClusterName, s.OSDPoolName, s.volume.Name, storagePoolVolumeTypeNameCustom, s.UserName, true)
+	if err != nil {
+		logger.Errorf("Failed to unmap RBD storage volume \"%s\" on storage pool \"%s\": %s", s.volume.Name, s.pool.Name, err)
+		return err
+	}
+
 	volumeMntPoint := getStoragePoolVolumeMountPoint(s.pool.Name, s.volume.Name)
+
 	err = os.MkdirAll(volumeMntPoint, 0711)
 	if err != nil {
 		logger.Errorf("Failed to create mountpoint \"%s\" for RBD storage volume \"%s\" on storage pool \"%s\": %s", volumeMntPoint, s.volume.Name, s.pool.Name, err)
@@ -2014,36 +2033,34 @@ func (s *storageCeph) copyVolumeWithoutSnapshotsSparse(source *api.StorageVolume
 		return err
 	}
 
-	// Re-generate the UUID
-	err = s.cephRBDGenerateUUID(s.volume.Name, storagePoolVolumeTypeNameCustom)
+	// Map the rbd
+	RBDDevPath, err := cephRBDVolumeMap(s.ClusterName, s.OSDPoolName, s.volume.Name, storagePoolVolumeTypeNameCustom, s.UserName)
 	if err != nil {
+		logger.Errorf("Failed to map RBD storage volume \"%s\" on storage pool \"%s\": %s", s.volume.Name, s.pool.Name, err)
 		return err
 	}
 
-	// Create the mountpoint
+	// Generate a new UUID
+	RBDFilesystem := s.getRBDFilesystem()
+	msg, err := fsGenerateNewUUID(RBDFilesystem, RBDDevPath)
+	if err != nil {
+		logger.Errorf("Failed to create new UUID for filesystem \"%s\" for RBD storage volume \"%s\" on storage pool \"%s\": %s: %s", RBDFilesystem, s.volume.Name, s.pool.Name, msg, err)
+		return err
+	}
+
+	// Unmap the rbd
+	err = cephRBDVolumeUnmap(s.ClusterName, s.OSDPoolName, s.volume.Name, storagePoolVolumeTypeNameCustom, s.UserName, true)
+	if err != nil {
+		logger.Errorf("Failed to unmap RBD storage volume \"%s\" on storage pool \"%s\": %s", s.volume.Name, s.pool.Name, err)
+		return err
+	}
+
 	volumeMntPoint := getStoragePoolVolumeMountPoint(s.pool.Name, s.volume.Name)
+
 	err = os.MkdirAll(volumeMntPoint, 0711)
 	if err != nil {
 		logger.Errorf("Failed to create mountpoint \"%s\" for RBD storage volume \"%s\" on storage pool \"%s\": %s", volumeMntPoint, s.volume.Name, s.pool.Name, err)
 		return err
-	}
-
-	return nil
-}
-
-// cephRBDGenerateUUID regenerates the XFS/btrfs UUID as needed
-func (s *storageCeph) cephRBDGenerateUUID(volumeName string, volumeType string) error {
-	// Map the RBD volume
-	RBDDevPath, err := cephRBDVolumeMap(s.ClusterName, s.OSDPoolName, volumeName, volumeType, s.UserName)
-	if err != nil {
-		return err
-	}
-	defer cephRBDVolumeUnmap(s.ClusterName, s.OSDPoolName, volumeName, volumeType, s.UserName, true)
-
-	// Update the UUID
-	msg, err := fsGenerateNewUUID(s.getRBDFilesystem(), RBDDevPath)
-	if err != nil {
-		return fmt.Errorf("Failed to regenerate UUID for '%v': %v: %v", volumeName, err, msg)
 	}
 
 	return nil

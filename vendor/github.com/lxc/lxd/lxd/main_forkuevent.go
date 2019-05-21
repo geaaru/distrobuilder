@@ -25,7 +25,7 @@ import (
 #include <time.h>
 #include <unistd.h>
 
-#include "../shared/netutils/network.c"
+#include "../shared/network.c"
 #include "include/memory_utils.h"
 
 #ifndef UEVENT_SEND

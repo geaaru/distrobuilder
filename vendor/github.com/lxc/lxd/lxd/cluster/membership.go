@@ -1,7 +1,6 @@
 package cluster
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -411,11 +410,6 @@ func Join(state *state.State, gateway *Gateway, cert *shared.CertInfo, name stri
 		err = tx.NodePending(node.ID, false)
 		if err != nil {
 			return errors.Wrapf(err, "failed to unmark the node as pending")
-		}
-
-		// Attempt to send a heartbeat to all other nodes
-		for _, node := range nodes {
-			go heartbeatNode(context.Background(), node.Address, cert, nodes)
 		}
 
 		return nil

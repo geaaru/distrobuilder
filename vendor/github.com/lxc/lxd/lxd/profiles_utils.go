@@ -229,24 +229,18 @@ func getProfileContainersInfo(cluster *db.Cluster, project, profile string) ([]d
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to query containers with profile '%s'", profile)
 	}
-
-	containers := []db.ContainerArgs{}
-	err = cluster.Transaction(func(tx *db.ClusterTx) error {
-		for ctProject, ctNames := range names {
-			for _, ctName := range ctNames {
-				container, err := tx.ContainerGet(ctProject, ctName)
-				if err != nil {
-					return err
-				}
-
-				containers = append(containers, db.ContainerToArgs(container))
-			}
+	containers := make([]db.ContainerArgs, len(names))
+	for i, name := range names {
+		var container *db.Container
+		err := cluster.Transaction(func(tx *db.ClusterTx) error {
+			var err error
+			container, err = tx.ContainerGet(project, name)
+			return err
+		})
+		if err != nil {
+			return nil, errors.Wrapf(err, "Failed to fetch container '%s'", name)
 		}
-
-		return nil
-	})
-	if err != nil {
-		return nil, errors.Wrapf(err, "Failed to fetch containers")
+		containers[i] = db.ContainerToArgs(container)
 	}
 
 	return containers, nil

@@ -15,20 +15,18 @@ import (
 	"github.com/lxc/lxd/shared/version"
 )
 
-var storagePoolVolumeSnapshotsTypeCmd = APIEndpoint{
-	Name: "storage-pools/{pool}/volumes/{type}/{name}/snapshots",
-
-	Get:  APIEndpointAction{Handler: storagePoolVolumeSnapshotsTypeGet, AccessHandler: AllowAuthenticated},
-	Post: APIEndpointAction{Handler: storagePoolVolumeSnapshotsTypePost},
+var storagePoolVolumeSnapshotsTypeCmd = Command{
+	name: "storage-pools/{pool}/volumes/{type}/{name}/snapshots",
+	post: storagePoolVolumeSnapshotsTypePost,
+	get:  storagePoolVolumeSnapshotsTypeGet,
 }
 
-var storagePoolVolumeSnapshotTypeCmd = APIEndpoint{
-	Name: "storage-pools/{pool}/volumes/{type}/{name}/snapshots/{snapshotName}",
-
-	Delete: APIEndpointAction{Handler: storagePoolVolumeSnapshotTypeDelete},
-	Get:    APIEndpointAction{Handler: storagePoolVolumeSnapshotTypeGet, AccessHandler: AllowAuthenticated},
-	Post:   APIEndpointAction{Handler: storagePoolVolumeSnapshotTypePost},
-	Put:    APIEndpointAction{Handler: storagePoolVolumeSnapshotTypePut},
+var storagePoolVolumeSnapshotTypeCmd = Command{
+	name:   "storage-pools/{pool}/volumes/{type}/{name}/snapshots/{snapshotName}",
+	post:   storagePoolVolumeSnapshotTypePost,
+	get:    storagePoolVolumeSnapshotTypeGet,
+	put:    storagePoolVolumeSnapshotTypePut,
+	delete: storagePoolVolumeSnapshotTypeDelete,
 }
 
 func storagePoolVolumeSnapshotsTypePost(d *Daemon, r *http.Request) Response {

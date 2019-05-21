@@ -18,7 +18,6 @@ import (
 	"github.com/CanonicalLtd/raft-http"
 	"github.com/CanonicalLtd/raft-membership"
 	"github.com/boltdb/bolt"
-	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	"github.com/hashicorp/raft-boltdb"
 	"github.com/lxc/lxd/lxd/db"
@@ -122,7 +121,7 @@ func raftInstanceInit(
 			return nil, err
 		}
 
-		transport, handler, layer, err = raftNetworkTransport(db, addr, log.New(&raftLogWriter{}, "", 0), timeout, dial)
+		transport, handler, layer, err = raftNetworkTransport(db, addr, raftLogger, timeout, dial)
 		if err != nil {
 			return nil, err
 		}
@@ -433,11 +432,8 @@ func raftHandler(info *shared.CertInfo, handler *rafthttp.Handler) http.HandlerF
 	}
 }
 
-func raftLogger() hclog.Logger {
-	return hclog.New(&hclog.LoggerOptions{
-		Name:   "raft",
-		Output: &raftLogWriter{},
-	})
+func raftLogger() *log.Logger {
+	return log.New(&raftLogWriter{}, "", 0)
 }
 
 // Implement io.Writer on top of LXD's logging system.

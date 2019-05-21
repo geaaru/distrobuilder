@@ -41,8 +41,7 @@ type migrationFields struct {
 	container     container
 
 	// storage specific fields
-	storage    storage
-	volumeOnly bool
+	storage storage
 }
 
 func (c *migrationFields) send(m proto.Message) error {
@@ -270,8 +269,7 @@ type MigrationSinkArgs struct {
 	Snapshots     []*migration.Snapshot
 
 	// Storage specific fields
-	Storage    storage
-	VolumeOnly bool
+	Storage storage
 
 	// Transport specific fields
 	RsyncFeatures []string
@@ -285,9 +283,6 @@ type MigrationSourceArgs struct {
 	// Transport specific fields
 	RsyncFeatures []string
 	ZfsFeatures   []string
-
-	// Volume specific fields
-	VolumeOnly bool
 }
 
 func (c *migrationSink) connectWithSecret(secret string) (*websocket.Conn, error) {

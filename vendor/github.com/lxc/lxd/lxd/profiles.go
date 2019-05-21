@@ -20,21 +20,19 @@ import (
 	"github.com/lxc/lxd/shared/version"
 )
 
-var profilesCmd = APIEndpoint{
-	Name: "profiles",
-
-	Get:  APIEndpointAction{Handler: profilesGet, AccessHandler: AllowProjectPermission("profiles", "view")},
-	Post: APIEndpointAction{Handler: profilesPost, AccessHandler: AllowProjectPermission("profiles", "manage-profiles")},
+var profilesCmd = Command{
+	name: "profiles",
+	get:  profilesGet,
+	post: profilesPost,
 }
 
-var profileCmd = APIEndpoint{
-	Name: "profiles/{name}",
-
-	Delete: APIEndpointAction{Handler: profileDelete, AccessHandler: AllowProjectPermission("profiles", "manage-profiles")},
-	Get:    APIEndpointAction{Handler: profileGet, AccessHandler: AllowProjectPermission("profiles", "view")},
-	Patch:  APIEndpointAction{Handler: profilePatch, AccessHandler: AllowProjectPermission("profiles", "manage-profiles")},
-	Post:   APIEndpointAction{Handler: profilePost, AccessHandler: AllowProjectPermission("profiles", "manage-profiles")},
-	Put:    APIEndpointAction{Handler: profilePut, AccessHandler: AllowProjectPermission("profiles", "manage-profiles")},
+var profileCmd = Command{
+	name:   "profiles/{name}",
+	get:    profileGet,
+	put:    profilePut,
+	delete: profileDelete,
+	post:   profilePost,
+	patch:  profilePatch,
 }
 
 /* This is used for both profiles post and profile put */

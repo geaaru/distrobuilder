@@ -27,10 +27,10 @@
 
 [[constraint]]
   branch = "master"
-  name = "github.com/geaaru/docker-companion"
+  name = "github.com/mudler/docker-companion"
 
 [[constraint]]
-  branch = "master"
+  version = "lxd-3.12"
   name = "github.com/lxc/lxd"
 
 [[constraint]]
@@ -54,14 +54,26 @@
   version = "2.2.2"
 
 [[override]]
-  branch = "master"
   name = "github.com/opencontainers/runtime-tools"
+  revision = "095789df6c2bc53a9dd4464cda8c22616d66e0d6"
 
 [[override]]
-  branch = "master"
+  revision = "5b71a03e2700cbb1091b78849b8748f5e1692650"
   name = "github.com/opencontainers/runtime-spec"
 
+[[override]]
+  name = "github.com/openSUSE/umoci"
+  version = "v0.4.4"
 
 [prune]
   go-tests = true
   unused-packages = true
+
+  [[prune.project]]
+    name = "github.com/openSUSE/umoci"
+    non-go = true
+
+  [[prune.project]]
+    name = "github.com/lxc/lxd"
+    unused-packages = false
+

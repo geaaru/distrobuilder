@@ -83,7 +83,6 @@ func ConnectLXDUnix(path string, args *ConnectionArgs) (ContainerServer, error) 
 	// Initialize the client struct
 	server := ProtocolLXD{
 		httpHost:      "http://unix.socket",
-		httpUnixPath:  path,
 		httpProtocol:  "unix",
 		httpUserAgent: args.UserAgent,
 	}

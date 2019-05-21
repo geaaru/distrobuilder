@@ -21,7 +21,6 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
-	"gopkg.in/lxc/go-lxc.v2"
 	"gopkg.in/macaroon-bakery.v2/bakery"
 	"gopkg.in/macaroon-bakery.v2/bakery/checkers"
 	"gopkg.in/macaroon-bakery.v2/bakery/identchecker"
@@ -32,7 +31,6 @@ import (
 	"github.com/lxc/lxd/lxd/endpoints"
 	"github.com/lxc/lxd/lxd/maas"
 	"github.com/lxc/lxd/lxd/node"
-	"github.com/lxc/lxd/lxd/rbac"
 	"github.com/lxc/lxd/lxd/state"
 	"github.com/lxc/lxd/lxd/sys"
 	"github.com/lxc/lxd/lxd/task"
@@ -51,7 +49,6 @@ type Daemon struct {
 	os           *sys.OS
 	db           *db.Node
 	maas         *maas.Controller
-	rbac         *rbac.Server
 	cluster      *db.Cluster
 	setupChan    chan struct{} // Closed when basic Daemon setup is completed
 	readyChan    chan struct{} // Closed when LXD is fully ready
@@ -69,7 +66,6 @@ type Daemon struct {
 	config    *DaemonConfig
 	endpoints *endpoints.Endpoints
 	gateway   *cluster.Gateway
-	seccomp   *SeccompServer
 
 	proxy func(req *http.Request) (*url.URL, error)
 
@@ -148,51 +144,21 @@ func DefaultDaemon() *Daemon {
 	return NewDaemon(config, os)
 }
 
-// APIEndpoint represents a URL in our API.
-type APIEndpoint struct {
-	Name   string
-	Get    APIEndpointAction
-	Put    APIEndpointAction
-	Post   APIEndpointAction
-	Delete APIEndpointAction
-	Patch  APIEndpointAction
-}
-
-// APIEndpointAction represents an action on an API endpoint.
-type APIEndpointAction struct {
-	Handler        func(d *Daemon, r *http.Request) Response
-	AccessHandler  func(d *Daemon, r *http.Request) Response
-	AllowUntrusted bool
-}
-
-// AllowAuthenticated is a AccessHandler which allows all requests
-func AllowAuthenticated(d *Daemon, r *http.Request) Response {
-	return EmptySyncResponse
-}
-
-// AllowProjectPermission is a wrapper to check access against the project, its features and RBAC permission
-func AllowProjectPermission(feature string, permission string) func(d *Daemon, r *http.Request) Response {
-	return func(d *Daemon, r *http.Request) Response {
-		// Shortcut for speed
-		if d.userIsAdmin(r) {
-			return EmptySyncResponse
-		}
-
-		// Get the project
-		project := projectParam(r)
-
-		// Validate whether the user has the needed permission
-		if !d.userHasPermission(r, project, permission) {
-			return Forbidden(nil)
-		}
-
-		return EmptySyncResponse
-	}
+// Command is the basic structure for every API call.
+type Command struct {
+	name          string
+	untrustedGet  bool
+	untrustedPost bool
+	get           func(d *Daemon, r *http.Request) Response
+	put           func(d *Daemon, r *http.Request) Response
+	post          func(d *Daemon, r *http.Request) Response
+	delete        func(d *Daemon, r *http.Request) Response
+	patch         func(d *Daemon, r *http.Request) Response
 }
 
 // Convenience function around Authenticate
 func (d *Daemon) checkTrustedClient(r *http.Request) error {
-	trusted, _, _, err := d.Authenticate(r)
+	trusted, _, err := d.Authenticate(r)
 	if !trusted || err != nil {
 		if err != nil {
 			return err
@@ -209,7 +175,7 @@ func (d *Daemon) checkTrustedClient(r *http.Request) error {
 // will validate the TLS certificate or Macaroon.
 //
 // This does not perform authorization, only validates authentication
-func (d *Daemon) Authenticate(r *http.Request) (bool, string, string, error) {
+func (d *Daemon) Authenticate(r *http.Request) (bool, string, error) {
 	// Allow internal cluster traffic
 	if r.TLS != nil {
 		cert, _ := x509.ParseCertificate(d.endpoints.NetworkCert().KeyPair().Certificate[0])
@@ -217,29 +183,29 @@ func (d *Daemon) Authenticate(r *http.Request) (bool, string, string, error) {
 		for i := range r.TLS.PeerCertificates {
 			trusted, _ := util.CheckTrustState(*r.TLS.PeerCertificates[i], clusterCerts)
 			if trusted {
-				return true, "", "cluster", nil
+				return true, "", nil
 			}
 		}
 	}
 
 	// Local unix socket queries
 	if r.RemoteAddr == "@" {
-		return true, "", "unix", nil
+		return true, "", nil
 	}
 
 	// Devlxd unix socket credentials on main API
 	if r.RemoteAddr == "@devlxd" {
-		return false, "", "", fmt.Errorf("Main API query can't come from /dev/lxd socket")
+		return false, "", fmt.Errorf("Main API query can't come from /dev/lxd socket")
 	}
 
 	// Cluster notification with wrong certificate
 	if isClusterNotification(r) {
-		return false, "", "", fmt.Errorf("Cluster notification isn't using cluster certificate")
+		return false, "", fmt.Errorf("Cluster notification isn't using cluster certificate")
 	}
 
 	// Bad query, no TLS found
 	if r.TLS == nil {
-		return false, "", "", fmt.Errorf("Bad/missing TLS on network query")
+		return false, "", fmt.Errorf("Bad/missing TLS on network query")
 	}
 
 	if d.externalAuth != nil && r.Header.Get(httpbakery.BakeryProtocolHeader) != "" {
@@ -255,28 +221,28 @@ func (d *Daemon) Authenticate(r *http.Request) (bool, string, string, error) {
 		info, err := authChecker.Allow(ctx, ops...)
 		if err != nil {
 			// Bad macaroon
-			return false, "", "", err
+			return false, "", err
 		}
 
 		if info != nil && info.Identity != nil {
 			// Valid identity macaroon found
-			return true, info.Identity.Id(), "candid", nil
+			return true, info.Identity.Id(), nil
 		}
 
 		// Valid macaroon with no identity information
-		return true, "", "candid", nil
+		return true, "", nil
 	}
 
 	// Validate normal TLS access
 	for i := range r.TLS.PeerCertificates {
 		trusted, username := util.CheckTrustState(*r.TLS.PeerCertificates[i], d.clientCerts)
 		if trusted {
-			return true, username, "tls", nil
+			return true, username, nil
 		}
 	}
 
 	// Reject unauthorized
-	return false, "", "", nil
+	return false, "", nil
 }
 
 func writeMacaroonsRequiredResponse(b *identchecker.Bakery, r *http.Request, w http.ResponseWriter, derr *bakery.DischargeRequiredError, expiry int64) {
@@ -331,12 +297,12 @@ func (d *Daemon) UnixSocket() string {
 	return filepath.Join(d.os.VarDir, "unix.socket")
 }
 
-func (d *Daemon) createCmd(restAPI *mux.Router, version string, c APIEndpoint) {
+func (d *Daemon) createCmd(restAPI *mux.Router, version string, c Command) {
 	var uri string
-	if c.Name == "" {
+	if c.name == "" {
 		uri = fmt.Sprintf("/%s", version)
 	} else {
-		uri = fmt.Sprintf("/%s/%s", version, c.Name)
+		uri = fmt.Sprintf("/%s/%s", version, c.name)
 	}
 
 	restAPI.HandleFunc(uri, func(w http.ResponseWriter, r *http.Request) {
@@ -353,7 +319,7 @@ func (d *Daemon) createCmd(restAPI *mux.Router, version string, c APIEndpoint) {
 		}
 
 		// Authentication
-		trusted, username, protocol, err := d.Authenticate(r)
+		trusted, username, err := d.Authenticate(r)
 		if err != nil {
 			// If not a macaroon discharge request, return the error
 			_, ok := err.(*bakery.DischargeRequiredError)
@@ -363,17 +329,7 @@ func (d *Daemon) createCmd(restAPI *mux.Router, version string, c APIEndpoint) {
 			}
 		}
 
-		// Reject internal queries to remote, non-cluster, clients
-		if version == "internal" && !shared.StringInSlice(protocol, []string{"unix", "cluster"}) {
-			// Except for the initial cluster accept request (done over trusted TLS)
-			if !trusted || c.Name != "cluster/accept" || protocol != "tls" {
-				logger.Warn("Rejecting remote internal API request", log.Ctx{"ip": r.RemoteAddr})
-				Forbidden(nil).Render(w)
-				return
-			}
-		}
-
-		untrustedOk := (r.Method == "GET" && c.Get.AllowUntrusted) || (r.Method == "POST" && c.Post.AllowUntrusted)
+		untrustedOk := (r.Method == "GET" && c.untrustedGet) || (r.Method == "POST" && c.untrustedPost)
 		if trusted {
 			logger.Debug("Handling", log.Ctx{"method": r.Method, "url": r.URL.RequestURI(), "ip": r.RemoteAddr, "user": username})
 			r = r.WithContext(context.WithValue(r.Context(), "username", username))
@@ -406,38 +362,27 @@ func (d *Daemon) createCmd(restAPI *mux.Router, version string, c APIEndpoint) {
 		var resp Response
 		resp = NotImplemented(nil)
 
-		handleRequest := func(action APIEndpointAction) Response {
-			if action.Handler == nil {
-				return NotImplemented(nil)
-			}
-
-			if action.AccessHandler != nil {
-				// Defer access control to custom handler
-				resp := action.AccessHandler(d, r)
-				if resp != EmptySyncResponse {
-					return resp
-				}
-			} else if !action.AllowUntrusted {
-				// Require admin privileges
-				if !d.userIsAdmin(r) {
-					return Forbidden(nil)
-				}
-			}
-
-			return action.Handler(d, r)
-		}
-
 		switch r.Method {
 		case "GET":
-			resp = handleRequest(c.Get)
+			if c.get != nil {
+				resp = c.get(d, r)
+			}
 		case "PUT":
-			resp = handleRequest(c.Put)
+			if c.put != nil {
+				resp = c.put(d, r)
+			}
 		case "POST":
-			resp = handleRequest(c.Post)
+			if c.post != nil {
+				resp = c.post(d, r)
+			}
 		case "DELETE":
-			resp = handleRequest(c.Delete)
+			if c.delete != nil {
+				resp = c.delete(d, r)
+			}
 		case "PATCH":
-			resp = handleRequest(c.Patch)
+			if c.patch != nil {
+				resp = c.patch(d, r)
+			}
 		default:
 			resp = NotFound(fmt.Errorf("Method '%s' not found", r.Method))
 		}
@@ -549,13 +494,6 @@ func (d *Daemon) init() error {
 		logger.Infof(" - uevent injection: no")
 	}
 
-	d.os.SeccompListener = CanUseSeccompListener()
-	if d.os.SeccompListener {
-		logger.Infof(" - seccomp listener: yes")
-	} else {
-		logger.Infof(" - seccomp listener: no")
-	}
-
 	/*
 	 * During daemon startup we're the only thread that touches VFS3Fscaps
 	 * so we don't need to bother with atomic.StoreInt32() when touching
@@ -575,19 +513,6 @@ func (d *Daemon) init() error {
 		logger.Infof(" - shiftfs support: yes")
 	} else {
 		logger.Infof(" - shiftfs support: no")
-	}
-
-	// Detect LXC features
-	d.os.LXCFeatures = map[string]bool{}
-	lxcExtensions := []string{
-		"mount_injection_file",
-		"seccomp_notify",
-		"network_ipvlan",
-		"network_l2proxy",
-		"network_gateway_device_route",
-	}
-	for _, extension := range lxcExtensions {
-		d.os.LXCFeatures[extension] = lxc.HasApiExtension(extension)
 	}
 
 	/* Initialize the database */
@@ -794,19 +719,10 @@ func (d *Daemon) init() error {
 	pruneLeftoverImages(d)
 
 	/* Setup the proxy handler, external authentication and MAAS */
-	candidAPIURL := ""
-	candidAPIKey := ""
+	var candidExpiry int64
 	candidDomains := ""
-	candidExpiry := int64(0)
-
-	rbacAPIURL := ""
-	rbacAPIKey := ""
-	rbacAgentURL := ""
-	rbacAgentUsername := ""
-	rbacAgentPrivateKey := ""
-	rbacAgentPublicKey := ""
-	rbacExpiry := int64(0)
-
+	candidEndpoint := ""
+	candidEndpointKey := ""
 	maasAPIURL := ""
 	maasAPIKey := ""
 	maasMachine := ""
@@ -834,29 +750,20 @@ func (d *Daemon) init() error {
 		d.proxy = shared.ProxyFromConfig(
 			config.ProxyHTTPS(), config.ProxyHTTP(), config.ProxyIgnoreHosts(),
 		)
-
-		candidAPIURL, candidAPIKey, candidExpiry, candidDomains = config.CandidServer()
+		candidEndpoint = config.CandidEndpoint()
+		candidEndpointKey = config.CandidEndpointKey()
+		candidExpiry = config.CandidExpiry()
+		candidDomains = config.CandidDomains()
 		maasAPIURL, maasAPIKey = config.MAASController()
-		rbacAPIURL, rbacAPIKey, rbacExpiry, rbacAgentURL, rbacAgentUsername, rbacAgentPrivateKey, rbacAgentPublicKey = config.RBACServer()
-
 		return nil
 	})
 	if err != nil {
 		return err
 	}
 
-	if rbacAPIURL != "" {
-		err = d.setupRBACServer(rbacAPIURL, rbacAPIKey, rbacExpiry, rbacAgentURL, rbacAgentUsername, rbacAgentPrivateKey, rbacAgentPublicKey)
-		if err != nil {
-			return err
-		}
-	}
-
-	if candidAPIURL != "" {
-		err = d.setupExternalAuthentication(candidAPIURL, candidAPIKey, candidExpiry, candidDomains)
-		if err != nil {
-			return err
-		}
+	err = d.setupExternalAuthentication(candidEndpoint, candidEndpointKey, candidExpiry, candidDomains)
+	if err != nil {
+		return err
 	}
 
 	if !d.os.MockMode {
@@ -871,16 +778,6 @@ func (d *Daemon) init() error {
 
 		deviceInotifyDirRescan(d.State())
 		go deviceInotifyHandler(d.State())
-
-		// Setup seccomp handler
-		if d.os.SeccompListener {
-			seccompServer, err := NewSeccompServer(d, shared.VarPath("seccomp.socket"))
-			if err != nil {
-				return err
-			}
-			d.seccomp = seccompServer
-			logger.Info("Started seccomp handler", log.Ctx{"path": shared.VarPath("seccomp.socket")})
-		}
 
 		// Read the trusted certificates
 		readSavedClientCAList(d)
@@ -1186,65 +1083,6 @@ func (d *Daemon) setupExternalAuthentication(authEndpoint string, authPubkey str
 	}
 
 	return nil
-}
-
-// Setup RBAC
-func (d *Daemon) setupRBACServer(rbacURL string, rbacKey string, rbacExpiry int64, rbacAgentURL string, rbacAgentUsername string, rbacAgentPrivateKey string, rbacAgentPublicKey string) error {
-	if d.rbac != nil || rbacURL == "" || rbacAgentURL == "" || rbacAgentUsername == "" || rbacAgentPrivateKey == "" || rbacAgentPublicKey == "" {
-		return nil
-	}
-
-	// Get a new server struct
-	server, err := rbac.NewServer(rbacURL, rbacKey, rbacAgentURL, rbacAgentUsername, rbacAgentPrivateKey, rbacAgentPublicKey)
-	if err != nil {
-		return err
-	}
-
-	// Set projects helper
-	server.ProjectsFunc = func() (map[int64]string, error) {
-		var result map[int64]string
-		err := d.cluster.Transaction(func(tx *db.ClusterTx) error {
-			var err error
-			result, err = tx.ProjectMap()
-			return err
-		})
-
-		return result, err
-	}
-
-	// Perform full sync
-	err = server.SyncProjects()
-	if err != nil {
-		return err
-	}
-
-	server.StartStatusCheck()
-
-	d.rbac = server
-
-	// Enable candid authentication
-	err = d.setupExternalAuthentication(fmt.Sprintf("%s/auth", rbacURL), rbacKey, rbacExpiry, "")
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (d *Daemon) userIsAdmin(r *http.Request) bool {
-	if d.externalAuth == nil || d.rbac == nil || r.RemoteAddr == "@" {
-		return true
-	}
-
-	return d.rbac.IsAdmin(r.Context().Value("username").(string))
-}
-
-func (d *Daemon) userHasPermission(r *http.Request, project string, permission string) bool {
-	if d.externalAuth == nil || d.rbac == nil || r.RemoteAddr == "@" {
-		return true
-	}
-
-	return d.rbac.HasPermission(r.Context().Value("username").(string), project, permission)
 }
 
 // Setup MAAS

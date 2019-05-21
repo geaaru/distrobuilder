@@ -32,9 +32,10 @@ func (p *ProgressRenderer) truncate(msg string) string {
 
 	newSize := len(msg)
 	if width < newSize {
-		return ""
+		newSize = width
 	}
 
+	msg = msg[0:newSize]
 	return msg
 }
 

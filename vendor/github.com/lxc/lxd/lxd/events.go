@@ -18,10 +18,9 @@ import (
 	"github.com/lxc/lxd/shared/logger"
 )
 
-var eventsCmd = APIEndpoint{
-	Name: "events",
-
-	Get: APIEndpointAction{Handler: eventsGet, AccessHandler: AllowAuthenticated},
+var eventsCmd = Command{
+	name: "events",
+	get:  eventsGet,
 }
 
 type eventsHandler struct {

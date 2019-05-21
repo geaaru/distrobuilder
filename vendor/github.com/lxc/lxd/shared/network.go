@@ -326,7 +326,7 @@ func defaultReader(conn *websocket.Conn, r io.ReadCloser, readDone chan<- bool) 
 	r.Close()
 }
 
-func DefaultWriter(conn *websocket.Conn, w io.WriteCloser, writeDone chan<- bool) {
+func defaultWriter(conn *websocket.Conn, w io.WriteCloser, writeDone chan<- bool) {
 	for {
 		mt, r, err := conn.NextReader()
 		if err != nil {
@@ -382,7 +382,7 @@ func WebsocketMirror(conn *websocket.Conn, w io.WriteCloser, r io.ReadCloser, Re
 
 	WriteFunc := Writer
 	if WriteFunc == nil {
-		WriteFunc = DefaultWriter
+		WriteFunc = defaultWriter
 	}
 
 	go ReadFunc(conn, r, readDone)
@@ -395,7 +395,7 @@ func WebsocketConsoleMirror(conn *websocket.Conn, w io.WriteCloser, r io.ReadClo
 	readDone := make(chan bool, 1)
 	writeDone := make(chan bool, 1)
 
-	go DefaultWriter(conn, w, writeDone)
+	go defaultWriter(conn, w, writeDone)
 
 	go func(conn *websocket.Conn, r io.ReadCloser) {
 		in := ReaderToChannel(r, -1)

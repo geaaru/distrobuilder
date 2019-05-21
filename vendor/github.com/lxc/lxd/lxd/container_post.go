@@ -19,10 +19,9 @@ import (
 	"github.com/lxc/lxd/shared/logger"
 )
 
-var internalClusterContainerMovedCmd = APIEndpoint{
-	Name: "cluster/container-moved/{name}",
-
-	Post: APIEndpointAction{Handler: internalClusterContainerMovedPost},
+var internalClusterContainerMovedCmd = Command{
+	name: "cluster/container-moved/{name}",
+	post: internalClusterContainerMovedPost,
 }
 
 func containerPost(d *Daemon, r *http.Request) Response {

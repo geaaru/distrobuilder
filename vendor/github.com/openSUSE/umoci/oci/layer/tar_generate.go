@@ -1,6 +1,6 @@
 /*
  * umoci: Umoci Modifies Open Containers' Images
- * Copyright (C) 2016, 2017 SUSE LLC.
+ * Copyright (C) 2016, 2017, 2018 SUSE LLC.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,23 +22,37 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"time"
+	"strings"
 
 	"github.com/apex/log"
 	"github.com/openSUSE/umoci/pkg/fseval"
+	"github.com/openSUSE/umoci/pkg/testutils"
 	"github.com/pkg/errors"
 )
 
-// ignoreXattrList is a list of xattr names that should be ignored when
+// ignoreXattrs is a list of xattr names that should be ignored when
 // creating a new image layer, because they are host-specific and/or would be a
-// bad idea to unpack.
+// bad idea to unpack. They are also excluded from Lclearxattr when extracting
+// an archive.
 // XXX: Maybe we should make this configurable so users can manually blacklist
 //      (or even whitelist) xattrs that they actually want included? Like how
 //      GNU tar's xattr setup works.
-var ignoreXattrList = map[string]struct{}{
+var ignoreXattrs = map[string]struct{}{
 	// SELinux doesn't allow you to set SELinux policies generically. They're
 	// also host-specific. So just ignore them during extraction.
 	"security.selinux": {},
+
+	// NFSv4 ACLs are very system-specific and shouldn't be touched by us, nor
+	// should they be included in images.
+	"system.nfs4_acl": {},
+}
+
+func init() {
+	// For test purposes we add a fake forbidden attribute that an unprivileged
+	// user can easily write to (and thus we can test it).
+	if testutils.IsTestBinary() {
+		ignoreXattrs["user.UMOCI:forbidden_xattr"] = struct{}{}
+	}
 }
 
 // tarGenerator is a helper for generating layer diff tars. It should be noted
@@ -87,6 +101,10 @@ func normalise(rawPath string, isDir bool) (string, error) {
 		return ".", nil
 	}
 
+	if filepath.IsAbs(path) {
+		path = strings.TrimPrefix(path, "/")
+	}
+
 	// Check that the path is "safe", meaning that it doesn't resolve outside
 	// of the tar archive. While this might seem paranoid, it is a legitimate
 	// concern.
@@ -109,7 +127,6 @@ func normalise(rawPath string, isDir bool) (string, error) {
 // hardlinks. This should be functionally equivalent to adding entries with GNU
 // tar.
 func (tg *tarGenerator) AddFile(name, path string) error {
-
 	fi, err := tg.fsEval.Lstat(path)
 	if err != nil {
 		return errors.Wrap(err, "add file lstat")
@@ -127,12 +144,23 @@ func (tg *tarGenerator) AddFile(name, path string) error {
 		return errors.Wrap(err, "convert fi to hdr")
 	}
 	hdr.Xattrs = map[string]string{}
+	// Usually incorrect for containers and was added in Go 1.10 causing
+	// changes to our output on a compiler bump...
+	hdr.Uname = ""
+	hdr.Gname = ""
 
 	name, err = normalise(name, fi.IsDir())
 	if err != nil {
 		return errors.Wrap(err, "normalise path")
 	}
 	hdr.Name = name
+
+	// Make sure that we don't include any files with the name ".wh.". This
+	// will almost certainly confuse some users (unfortunately) but there's
+	// nothing we can do to store such files on-disk.
+	if strings.HasPrefix(filepath.Base(name), whPrefix) {
+		return errors.Errorf("invalid path has whiteout prefix %q: %s", whPrefix, name)
+	}
 
 	// FIXME: Do we need to ensure that the parent paths have all been added to
 	//        the archive? I haven't found any tar specification that makes
@@ -162,10 +190,12 @@ func (tg *tarGenerator) AddFile(name, path string) error {
 		// Some xattrs need to be skipped for sanity reasons, such as
 		// security.selinux, because they are very much host-specific and
 		// carrying them to other hosts would be a really bad idea.
-		if _, ignore := ignoreXattrList[name]; ignore {
+		if _, ignore := ignoreXattrs[name]; ignore {
 			continue
 		}
-
+		// TODO: We should translate all v3 capabilities into root-owned
+		//       capabilities here. But we don't have Go code for that yet
+		//       (we'd need to use libcap to parse it).
 		value, err := tg.fsEval.Lgetxattr(path, name)
 		if err != nil {
 			// XXX: I'm not sure if we're unprivileged whether Lgetxattr can
@@ -181,6 +211,8 @@ func (tg *tarGenerator) AddFile(name, path string) error {
 			log.Warnf("ignoring empty-valued xattr %s: disallowed by PAX standard", name)
 			continue
 		}
+		// Note that Go strings can actually be arbitrary byte sequences, so
+		// this conversion (while it might look a bit wrong) is actually fine.
 		hdr.Xattrs[name] = string(value)
 	}
 
@@ -224,31 +256,50 @@ func (tg *tarGenerator) AddFile(name, path string) error {
 	return nil
 }
 
+// whPrefix is the whiteout prefix, which is used to signify "special" files in
+// an OCI image layer archive. An expanded filesystem image cannot contain
+// files that have a basename starting with this prefix.
 const whPrefix = ".wh."
 
-// AddWhiteout adds a whiteout file for the given name inside the tar archive.
-// It's not recommended to add a file with AddFile and then white it out.
-func (tg *tarGenerator) AddWhiteout(name string) error {
+// whOpaque is the *full* basename of a special file which indicates that all
+// siblings in a directory are to be dropped in the "lower" layer.
+const whOpaque = whPrefix + whPrefix + ".opq"
+
+// addWhiteout adds a whiteout file for the given name inside the tar archive.
+// It's not recommended to add a file with AddFile and then white it out. If
+// you specify opaque, then the whiteout created is an opaque whiteout *for the
+// directory path* given.
+func (tg *tarGenerator) addWhiteout(name string, opaque bool) error {
 	name, err := normalise(name, false)
 	if err != nil {
 		return errors.Wrap(err, "normalise path")
 	}
 
-	// Create the explicit whiteout for the file.
+	// Disallow having a whiteout of a whiteout, purely for our own sanity.
 	dir, file := filepath.Split(name)
-	whiteout := filepath.Join(dir, whPrefix+file)
-	timestamp := time.Now()
-
-	// Add a dummy header for the whiteout file.
-	if err := tg.tw.WriteHeader(&tar.Header{
-		Name:       whiteout,
-		Size:       0,
-		ModTime:    timestamp,
-		AccessTime: timestamp,
-		ChangeTime: timestamp,
-	}); err != nil {
-		return errors.Wrap(err, "write whiteout header")
+	if strings.HasPrefix(file, whPrefix) {
+		return errors.Errorf("invalid path has whiteout prefix %q: %s", whPrefix, name)
 	}
 
-	return nil
+	// Figure out the whiteout name.
+	whiteout := filepath.Join(dir, whPrefix+file)
+	if opaque {
+		whiteout = filepath.Join(name, whOpaque)
+	}
+
+	// Add a dummy header for the whiteout file.
+	return errors.Wrap(tg.tw.WriteHeader(&tar.Header{
+		Name: whiteout,
+		Size: 0,
+	}), "write whiteout header")
+}
+
+// AddWhiteout creates a whiteout for the provided path.
+func (tg *tarGenerator) AddWhiteout(name string) error {
+	return tg.addWhiteout(name, false)
+}
+
+// AddOpaqueWhiteout creates a whiteout for the provided path.
+func (tg *tarGenerator) AddOpaqueWhiteout(name string) error {
+	return tg.addWhiteout(name, true)
 }

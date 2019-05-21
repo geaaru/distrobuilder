@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"reflect"
 	"sync"
 	"sync/atomic"
 
@@ -308,9 +309,8 @@ func storageInit(s *state.State, project, poolName, volumeName string, volumeTyp
 
 	// Load the storage volume.
 	volume := &api.StorageVolume{}
-	volumeID := int64(-1)
-	if volumeName != "" {
-		volumeID, volume, err = s.Cluster.StoragePoolNodeVolumeGetTypeByProject(project, volumeName, volumeType, poolID)
+	if volumeName != "" && volumeType >= 0 {
+		_, volume, err = s.Cluster.StoragePoolNodeVolumeGetTypeByProject(project, volumeName, volumeType, poolID)
 		if err != nil {
 			return nil, err
 		}
@@ -338,7 +338,6 @@ func storageInit(s *state.State, project, poolName, volumeName string, volumeTyp
 		dir.poolID = poolID
 		dir.pool = pool
 		dir.volume = volume
-		dir.volumeID = volumeID
 		dir.s = s
 		err = dir.StoragePoolInit()
 		if err != nil {
@@ -451,7 +450,7 @@ func storagePoolVolumeAttachInit(s *state.State, poolName string, volumeName str
 		return nil, err
 	}
 
-	if !nextIdmap.Equals(lastIdmap) {
+	if !reflect.DeepEqual(nextIdmap, lastIdmap) {
 		logger.Debugf("Shifting storage volume")
 		volumeUsedBy, err := storagePoolVolumeUsedByContainersGet(s,
 			"default", volumeName, volumeTypeName)
@@ -476,8 +475,8 @@ func storagePoolVolumeAttachInit(s *state.State, poolName string, volumeName str
 					return nil, fmt.Errorf("Failed to retrieve idmap of container")
 				}
 
-				if !nextIdmap.Equals(ctNextIdmap) {
-					return nil, fmt.Errorf("Idmaps of container %v and storage volume %v are not identical", ctName, volumeName)
+				if !reflect.DeepEqual(nextIdmap, ctNextIdmap) {
+					return nil, fmt.Errorf("Idmaps of container %v and storage volume %v are not identical", ctNextIdmap, nextIdmap)
 				}
 			}
 		} else if len(volumeUsedBy) == 1 {
@@ -765,7 +764,7 @@ func resetContainerDiskIdmap(container container, srcIdmap *idmap.IdmapSet) erro
 		dstIdmap = new(idmap.IdmapSet)
 	}
 
-	if !srcIdmap.Equals(dstIdmap) {
+	if !reflect.DeepEqual(srcIdmap, dstIdmap) {
 		var jsonIdmap string
 		if srcIdmap != nil {
 			idmapBytes, err := json.Marshal(srcIdmap.Idmap)
@@ -777,7 +776,7 @@ func resetContainerDiskIdmap(container container, srcIdmap *idmap.IdmapSet) erro
 			jsonIdmap = "[]"
 		}
 
-		err := container.VolatileSet(map[string]string{"volatile.last_state.idmap": jsonIdmap})
+		err := container.ConfigKeySet("volatile.last_state.idmap", jsonIdmap)
 		if err != nil {
 			return err
 		}

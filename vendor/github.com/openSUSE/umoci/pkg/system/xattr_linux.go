@@ -1,6 +1,6 @@
 /*
  * umoci: Umoci Modifies Open Containers' Images
- * Copyright (C) 2016, 2017 SUSE LLC.
+ * Copyright (C) 2016, 2017, 2018 SUSE LLC.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -98,12 +98,15 @@ func Lgetxattr(path string, name string) ([]byte, error) {
 
 // Lclearxattrs is a wrapper around Llistxattr and Lremovexattr, which attempts
 // to remove all xattrs from a given file.
-func Lclearxattrs(path string) error {
+func Lclearxattrs(path string, except map[string]struct{}) error {
 	names, err := Llistxattr(path)
 	if err != nil {
 		return errors.Wrap(err, "lclearxattrs: get list")
 	}
 	for _, name := range names {
+		if _, skip := except[name]; skip {
+			continue
+		}
 		if err := unix.Lremovexattr(path, name); err != nil {
 			// Ignore permission errors, because hitting a permission error
 			// means that it's a security.* xattr label or something similar.

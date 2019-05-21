@@ -276,10 +276,6 @@ func ProfileConfigAdd(tx *sql.Tx, id int64, config map[string]string) error {
 	}
 
 	for k, v := range config {
-		if v == "" {
-			continue
-		}
-
 		_, err = stmt.Exec(id, k, v)
 		if err != nil {
 			return err
@@ -291,7 +287,7 @@ func ProfileConfigAdd(tx *sql.Tx, id int64, config map[string]string) error {
 
 // ProfileContainersGet gets the names of the containers associated with the
 // profile with the given name.
-func (c *Cluster) ProfileContainersGet(project, profile string) (map[string][]string, error) {
+func (c *Cluster) ProfileContainersGet(project, profile string) ([]string, error) {
 	err := c.Transaction(func(tx *ClusterTx) error {
 		enabled, err := tx.ProjectHasProfiles(project)
 		if err != nil {
@@ -306,31 +302,24 @@ func (c *Cluster) ProfileContainersGet(project, profile string) (map[string][]st
 		return nil, err
 	}
 
-	q := `SELECT containers.name, projects.name FROM containers
-		JOIN containers_profiles ON containers.id == containers_profiles.container_id
-		JOIN projects ON projects.id == containers.project_id
-		WHERE containers_profiles.profile_id ==
-		  (SELECT profiles.id FROM profiles
-		   JOIN projects ON projects.id == profiles.project_id
-		   WHERE profiles.name=? AND projects.name=?)
-		AND containers.type == 0`
+	q := `SELECT containers.name FROM containers JOIN containers_profiles
+		ON containers.id == containers_profiles.container_id
+		JOIN profiles ON containers_profiles.profile_id == profiles.id
+		JOIN projects ON projects.id == profiles.project_id
+		WHERE projects.name == ? AND profiles.name == ? AND containers.type == 0`
 
-	results := map[string][]string{}
-	inargs := []interface{}{profile, project}
+	results := []string{}
+	inargs := []interface{}{project, profile}
 	var name string
-	outfmt := []interface{}{name, name}
+	outfmt := []interface{}{name}
 
 	output, err := queryScan(c.db, q, inargs, outfmt)
 	if err != nil {
-		return nil, err
+		return results, err
 	}
 
 	for _, r := range output {
-		if results[r[1].(string)] == nil {
-			results[r[1].(string)] = []string{}
-		}
-
-		results[r[1].(string)] = append(results[r[1].(string)], r[0].(string))
+		results = append(results, r[0].(string))
 	}
 
 	return results, nil

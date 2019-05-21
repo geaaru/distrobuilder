@@ -111,7 +111,7 @@ func containerMetadataPut(d *Daemon, r *http.Request) Response {
 	}
 
 	if err := ioutil.WriteFile(metadataPath, data, 0644); err != nil {
-		return InternalError(err)
+		InternalError(err)
 	}
 
 	return EmptySyncResponse

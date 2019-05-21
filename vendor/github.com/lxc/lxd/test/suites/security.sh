@@ -130,7 +130,7 @@ test_security_protection() {
   lxc profile unset default security.protection.delete
 
   # Test shifting protection
-  if ! grep -q shiftfs /proc/filesystems; then
+  if [ ! -e /sys/module/shiftfs/ ]; then
     lxc init testimage c1
     lxc start c1
     lxc stop c1 --force

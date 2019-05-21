@@ -33,8 +33,9 @@ import (
 type imageStreamCacheEntry struct {
 	Aliases      []api.ImageAliasesEntry `yaml:"aliases"`
 	Certificate  string                  `yaml:"certificate"`
-	Expiry       time.Time               `yaml:"expiry"`
 	Fingerprints []string                `yaml:"fingerprints"`
+
+	expiry time.Time
 }
 
 var imageStreamCacheLock sync.Mutex
@@ -103,7 +104,7 @@ func (d *Daemon) ImageDownload(op *operation, server string, protocol string, ce
 		}
 
 		entry, _ := imageStreamCache[server]
-		if entry == nil || entry.Expiry.Before(time.Now()) {
+		if entry == nil || entry.expiry.Before(time.Now()) {
 			// Add a new entry to the cache
 			refresh := func() (*imageStreamCacheEntry, error) {
 				// Setup simplestreams client
@@ -134,7 +135,7 @@ func (d *Daemon) ImageDownload(op *operation, server string, protocol string, ce
 				}
 
 				// Generate cache entry
-				entry = &imageStreamCacheEntry{Aliases: aliases, Certificate: certificate, Fingerprints: fingerprints, Expiry: time.Now().Add(time.Hour)}
+				entry = &imageStreamCacheEntry{Aliases: aliases, Certificate: certificate, Fingerprints: fingerprints, expiry: time.Now().Add(time.Hour)}
 				imageStreamCache[server] = entry
 				imageSaveStreamCache(d.os, imageStreamCache)
 
@@ -148,7 +149,7 @@ func (d *Daemon) ImageDownload(op *operation, server string, protocol string, ce
 			} else if entry != nil {
 				// Failed to fetch entry but existing cache
 				logger.Warn("Unable to refresh cache, using stale entry", log.Ctx{"server": server})
-				entry.Expiry = time.Now().Add(time.Hour)
+				entry.expiry = time.Now().Add(time.Hour)
 			} else {
 				// Failed to fetch entry and nothing in cache
 				imageStreamCacheLock.Unlock()
@@ -156,7 +157,7 @@ func (d *Daemon) ImageDownload(op *operation, server string, protocol string, ce
 			}
 		} else {
 			// use the existing entry
-			logger.Debug("Using SimpleStreams cache entry", log.Ctx{"server": server, "expiry": entry.Expiry})
+			logger.Debug("Using SimpleStreams cache entry", log.Ctx{"server": server, "expiry": entry.expiry})
 
 			remote, err = lxd.ConnectSimpleStreams(server, &lxd.ConnectionArgs{
 				TLSServerCert: entry.Certificate,
@@ -528,8 +529,6 @@ func (d *Daemon) ImageDownload(op *operation, server string, protocol string, ce
 		info.CreatedAt = time.Unix(imageMeta.CreationDate, 0)
 		info.ExpiresAt = time.Unix(imageMeta.ExpiryDate, 0)
 		info.Properties = imageMeta.Properties
-	} else {
-		return nil, fmt.Errorf("Unsupported protocol: %v", protocol)
 	}
 
 	// Override visiblity

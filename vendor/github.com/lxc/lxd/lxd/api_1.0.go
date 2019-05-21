@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"strings"
 
 	"gopkg.in/lxc/go-lxc.v2"
 
@@ -22,16 +21,19 @@ import (
 	"github.com/pkg/errors"
 )
 
-var api10Cmd = APIEndpoint{
-	Get:   APIEndpointAction{Handler: api10Get, AllowUntrusted: true},
-	Patch: APIEndpointAction{Handler: api10Patch},
-	Put:   APIEndpointAction{Handler: api10Put},
+var api10Cmd = Command{
+	name:         "",
+	untrustedGet: true,
+	get:          api10Get,
+	put:          api10Put,
+	patch:        api10Patch,
 }
 
-var api10 = []APIEndpoint{
+var api10 = []Command{
+	aliasCmd,
+	aliasesCmd,
 	api10Cmd,
-	api10ResourcesCmd,
-	certificateCmd,
+	certificateFingerprintCmd,
 	certificatesCmd,
 	clusterCmd,
 	clusterNodeCmd,
@@ -52,8 +54,6 @@ var api10 = []APIEndpoint{
 	containerSnapshotsCmd,
 	containerStateCmd,
 	eventsCmd,
-	imageAliasCmd,
-	imageAliasesCmd,
 	imageCmd,
 	imageExportCmd,
 	imageRefreshCmd,
@@ -71,16 +71,18 @@ var api10 = []APIEndpoint{
 	profilesCmd,
 	projectCmd,
 	projectsCmd,
+	serverResourceCmd,
+	serverResourceCmd,
 	storagePoolCmd,
 	storagePoolResourcesCmd,
 	storagePoolsCmd,
 	storagePoolVolumesCmd,
-	storagePoolVolumeSnapshotsTypeCmd,
-	storagePoolVolumeSnapshotTypeCmd,
 	storagePoolVolumesTypeCmd,
 	storagePoolVolumeTypeContainerCmd,
 	storagePoolVolumeTypeCustomCmd,
 	storagePoolVolumeTypeImageCmd,
+	storagePoolVolumeSnapshotsTypeCmd,
+	storagePoolVolumeSnapshotTypeCmd,
 }
 
 func api10Get(d *Daemon, r *http.Request) Response {
@@ -90,13 +92,9 @@ func api10Get(d *Daemon, r *http.Request) Response {
 		if err != nil {
 			return err
 		}
-
-		candidURL, _, _, _ := config.CandidServer()
-		rbacURL, _, _, _, _, _, _ := config.RBACServer()
-		if candidURL != "" || rbacURL != "" {
+		if config.CandidEndpoint() != "" {
 			authMethods = append(authMethods, "candid")
 		}
-
 		return nil
 	})
 	if err != nil {
@@ -207,15 +205,7 @@ func api10Get(d *Daemon, r *http.Request) Response {
 		"netnsid_getifaddrs": fmt.Sprintf("%v", d.os.NetnsGetifaddrs),
 		"uevent_injection":   fmt.Sprintf("%v", d.os.UeventInjection),
 		"unpriv_fscaps":      fmt.Sprintf("%v", d.os.VFS3Fscaps),
-		"seccomp_listener":   fmt.Sprintf("%v", d.os.SeccompListener),
 		"shiftfs":            fmt.Sprintf("%v", d.os.Shiftfs),
-	}
-
-	if d.os.LXCFeatures != nil {
-		env.LXCFeatures = map[string]string{}
-		for k, v := range d.os.LXCFeatures {
-			env.LXCFeatures[k] = fmt.Sprintf("%v", v)
-		}
 	}
 
 	drivers := readStoragePoolDriversCache()
@@ -366,25 +356,6 @@ func doApi10Update(d *Daemon, req api.ServerPut, patch bool) Response {
 		}
 	}
 
-	// Validate global configuration
-	hasRBAC := false
-	hasCandid := false
-	for k, v := range req.Config {
-		if v == "" {
-			continue
-		}
-
-		if strings.HasPrefix(k, "candid.") {
-			hasCandid = true
-		} else if strings.HasPrefix(k, "rbac.") {
-			hasRBAC = true
-		}
-
-		if hasCandid && hasRBAC {
-			return BadRequest(fmt.Errorf("RBAC and Candid are mutually exclusive"))
-		}
-	}
-
 	// Then deal with cluster wide configuration
 	var clusterChanged map[string]string
 	var newClusterConfig *cluster.Config
@@ -444,7 +415,6 @@ func doApi10Update(d *Daemon, req api.ServerPut, patch bool) Response {
 func doApi10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]string, nodeConfig *node.Config, clusterConfig *cluster.Config) error {
 	maasChanged := false
 	candidChanged := false
-	rbacChanged := false
 
 	for key := range clusterChanged {
 		switch key {
@@ -474,20 +444,6 @@ func doApi10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 			if !d.os.MockMode {
 				d.taskPruneImages.Reset()
 			}
-		case "rbac.agent.url":
-			fallthrough
-		case "rbac.agent.username":
-			fallthrough
-		case "rbac.agent.private_key":
-			fallthrough
-		case "rbac.agent.public_key":
-			fallthrough
-		case "rbac.api.url":
-			fallthrough
-		case "rbac.api.key":
-			fallthrough
-		case "rbac.expiry":
-			rbacChanged = true
 		}
 	}
 
@@ -535,28 +491,12 @@ func doApi10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 	}
 
 	if candidChanged {
-		apiURL, apiKey, expiry, domains := clusterConfig.CandidServer()
-		err := d.setupExternalAuthentication(apiURL, apiKey, expiry, domains)
-		if err != nil {
-			return err
-		}
-	}
+		endpoint := clusterConfig.CandidEndpoint()
+		endpointKey := clusterConfig.CandidEndpointKey()
+		expiry := clusterConfig.CandidExpiry()
+		domains := clusterConfig.CandidDomains()
 
-	if rbacChanged {
-		apiURL, apiKey, apiExpiry, agentURL, agentUsername, agentPrivateKey, agentPublicKey := clusterConfig.RBACServer()
-
-		// Since RBAC seems to have been set up already, we need to disable it temporarily
-		if d.rbac != nil {
-			err := d.setupExternalAuthentication("", "", 0, "")
-			if err != nil {
-				return err
-			}
-
-			d.rbac.StopStatusCheck()
-			d.rbac = nil
-		}
-
-		err := d.setupRBACServer(apiURL, apiKey, apiExpiry, agentURL, agentUsername, agentPrivateKey, agentPublicKey)
+		err := d.setupExternalAuthentication(endpoint, endpointKey, expiry, domains)
 		if err != nil {
 			return err
 		}

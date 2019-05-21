@@ -25,21 +25,6 @@ type proxyProcInfo struct {
 	proxyProtocol  string
 }
 
-func parseAddr(addr string) (string, string) {
-	fields := strings.SplitN(addr, ":", 2)
-	return fields[0], fields[1]
-}
-
-func rewriteHostAddr(addr string) string {
-	proto, addr := parseAddr(addr)
-	if proto == "unix" && !strings.HasPrefix(addr, "@") {
-		// Unix non-abstract sockets need to be addressed to the host
-		// filesystem, not be scoped inside the LXD snap.
-		addr = shared.HostPath(addr)
-	}
-	return fmt.Sprintf("%s:%s", proto, addr)
-}
-
 func setupProxyProcInfo(c container, device map[string]string) (*proxyProcInfo, error) {
 	pid := c.InitPID()
 	containerPid := strconv.Itoa(int(pid))
@@ -48,32 +33,38 @@ func setupProxyProcInfo(c container, device map[string]string) (*proxyProcInfo, 
 	connectAddr := device["connect"]
 	listenAddr := device["listen"]
 
-	if proto, _ := parseAddr(connectAddr); !shared.StringInSlice(proto, []string{"tcp", "udp", "unix"}) {
-		return nil, fmt.Errorf("Proxy device doesn't support the connection type: %s", proto)
+	connectionFields := strings.SplitN(connectAddr, ":", 2)
+	listenerFields := strings.SplitN(listenAddr, ":", 2)
+
+	if !shared.StringInSlice(connectionFields[0], []string{"tcp", "udp", "unix"}) {
+		return nil, fmt.Errorf("Proxy device doesn't support the connection type: %s", connectionFields[0])
 	}
-	if proto, _ := parseAddr(listenAddr); !shared.StringInSlice(proto, []string{"tcp", "udp", "unix"}) {
-		return nil, fmt.Errorf("Proxy device doesn't support the listener type: %s", proto)
+
+	if !shared.StringInSlice(listenerFields[0], []string{"tcp", "udp", "unix"}) {
+		return nil, fmt.Errorf("Proxy device doesn't support the listener type: %s", listenerFields[0])
 	}
 
 	listenPid := "-1"
 	connectPid := "-1"
 
 	bindVal, exists := device["bind"]
-	if !exists {
-		bindVal = "host"
-	}
 
-	switch bindVal {
-	case "host":
+	if bindVal == "host" || !exists {
 		listenPid = lxdPid
 		connectPid = containerPid
-		listenAddr = rewriteHostAddr(listenAddr)
-	case "container":
+	} else if bindVal == "container" {
 		listenPid = containerPid
 		connectPid = lxdPid
-		connectAddr = rewriteHostAddr(connectAddr)
-	default:
+	} else {
 		return nil, fmt.Errorf("Invalid binding side given. Must be \"host\" or \"container\"")
+	}
+
+	if connectionFields[0] == "unix" && !strings.HasPrefix(connectionFields[1], "@") && bindVal == "container" {
+		connectAddr = fmt.Sprintf("%s:%s", connectionFields[0], shared.HostPath(connectionFields[1]))
+	}
+
+	if listenerFields[0] == "unix" && !strings.HasPrefix(connectionFields[1], "@") && bindVal == "host" {
+		listenAddr = fmt.Sprintf("%s:%s", listenerFields[0], shared.HostPath(listenerFields[1]))
 	}
 
 	p := &proxyProcInfo{
