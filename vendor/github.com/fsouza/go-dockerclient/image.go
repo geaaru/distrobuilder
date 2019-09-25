@@ -412,6 +412,7 @@ func (c *Client) ExportImages(opts ExportImagesOptions) error {
 			OutputStream:      opts.OutputStream,
 			InactivityTimeout: opts.InactivityTimeout,
 			Context:           opts.Context,
+
 		})
 	} else {
 		exporturl, err = c.getPath("/images/get", &opts)

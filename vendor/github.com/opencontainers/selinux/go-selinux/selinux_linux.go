@@ -9,7 +9,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"golang.org/x/sys/unix"
 	"io"
 	"io/ioutil"
 	"os"
@@ -19,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -394,7 +394,7 @@ func SetExecLabel(label string) error {
 }
 
 /*
-SetTaskLabel sets the SELinux label for the current thread, or an error.
+SetTaskLabel sets the SELinux label for the current thread, or an error. 
 This requires the dyntransition permission.
 */
 func SetTaskLabel(label string) error {

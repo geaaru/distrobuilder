@@ -79,7 +79,7 @@ func (e *Export) deleteWhiteouts(location string) error {
 		parent := filepath.Dir(p)
 		// if start with whiteout
 		if strings.Index(name, ".wh.") == 0 {
-			deletedFile := path.Join(parent, name[len(".wh."):])
+			deletedFile := path.Join(parent, name[len(".wh."):len(name)])
 			// remove deleted files
 			if err := os.RemoveAll(deletedFile); err != nil {
 				return err
