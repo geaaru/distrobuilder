@@ -29,4 +29,6 @@ type Plan9Share struct {
 	ReadOnly bool `json:"ReadOnly,omitempty"`
 
 	UseShareRootIdentity bool `json:"UseShareRootIdentity,omitempty"`
+
+	AllowedFiles []string `json:"AllowedFiles,omitempty"`
 }

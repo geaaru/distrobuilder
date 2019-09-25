@@ -16,7 +16,7 @@ type ComputeSystem struct {
 
 	HostingSystemId string `json:"HostingSystemId,omitempty"`
 
-	HostedSystem *HostedSystem `json:"HostedSystem,omitempty"`
+	HostedSystem interface{} `json:"HostedSystem,omitempty"`
 
 	Container *Container `json:"Container,omitempty"`
 
