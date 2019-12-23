@@ -57,6 +57,8 @@ func Get(name string) *Manager {
 		return NewYum()
 	case "equo":
 		return NewEquo()
+	case "luet":
+		return NewLuet()
 	case "zypper":
 		return NewZypper()
 	}
