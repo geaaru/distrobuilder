@@ -258,6 +258,14 @@ func (c *cmdGlobal) preRunBuild(cmd *cobra.Command, args []string) error {
 	// Unmount everything and exit the chroot
 	defer exitChroot()
 
+	// Run post unpack hook
+	for _, hook := range c.definition.GetRunnableActions("post-unpack") {
+		err := shared.RunScript(hook.Action)
+		if err != nil {
+			return fmt.Errorf("Failed to run post-unpack: %s", err)
+		}
+	}
+
 	var manager *managers.Manager
 
 	if c.definition.Packages.Manager != "" {
@@ -272,14 +280,6 @@ func (c *cmdGlobal) preRunBuild(cmd *cobra.Command, args []string) error {
 	err = manageRepositories(c.definition, manager)
 	if err != nil {
 		return fmt.Errorf("Failed to manage repositories: %s", err)
-	}
-
-	// Run post unpack hook
-	for _, hook := range c.definition.GetRunnableActions("post-unpack") {
-		err := shared.RunScript(hook.Action)
-		if err != nil {
-			return fmt.Errorf("Failed to run post-unpack: %s", err)
-		}
 	}
 
 	// Install/remove/update packages
