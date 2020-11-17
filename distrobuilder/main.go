@@ -337,18 +337,6 @@ func (c *cmdGlobal) preRunBuild(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	manager, err := managers.Load(c.ctx, c.definition.Packages.Manager, c.logger, *c.definition)
-	if err != nil {
-		return fmt.Errorf("Failed to load manager %q: %w", c.definition.Packages.Manager, err)
-	}
-
-	c.logger.Info("Managing repositories")
-
-	err = manager.ManageRepositories(imageTargets)
-	if err != nil {
-		return fmt.Errorf("Failed to manage repositories: %w", err)
-	}
-
 	c.logger.WithField("trigger", "post-unpack").Info("Running hooks")
 
 	// Run post unpack hook
@@ -364,6 +352,18 @@ func (c *cmdGlobal) preRunBuild(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("Failed to run post-unpack: %w", err)
 		}
+	}
+
+	manager, err := managers.Load(c.ctx, c.definition.Packages.Manager, c.logger, *c.definition)
+	if err != nil {
+		return fmt.Errorf("Failed to load maynager %q: %w", c.definition.Packages.Manager, err)
+	}
+
+	c.logger.Info("Managing repositories")
+
+	err = manager.ManageRepositories(imageTargets)
+	if err != nil {
+		return fmt.Errorf("Failed to manage repositories: %w", err)
 	}
 
 	c.logger.Info("Managing packages")
