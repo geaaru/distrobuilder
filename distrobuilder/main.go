@@ -289,6 +289,14 @@ func (c *cmdGlobal) preRunBuild(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Run post unpack hook
+	for _, hook := range c.definition.GetRunnableActions("post-unpack", imageTargets) {
+		err := shared.RunScript(hook.Action)
+		if err != nil {
+			return errors.Wrap(err, "Failed to run post-unpack")
+		}
+	}
+
 	var manager *managers.Manager
 
 	if c.definition.Packages.Manager != "" {
@@ -303,14 +311,6 @@ func (c *cmdGlobal) preRunBuild(cmd *cobra.Command, args []string) error {
 	err = manageRepositories(c.definition, manager, imageTargets)
 	if err != nil {
 		return errors.Wrap(err, "Failed to manage repositories")
-	}
-
-	// Run post unpack hook
-	for _, hook := range c.definition.GetRunnableActions("post-unpack", imageTargets) {
-		err := shared.RunScript(hook.Action)
-		if err != nil {
-			return errors.Wrap(err, "Failed to run post-unpack")
-		}
 	}
 
 	// Install/remove/update packages
