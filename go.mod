@@ -20,7 +20,7 @@ require (
 	github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51 // indirect
 	github.com/klauspost/compress v1.11.12 // indirect
 	github.com/klauspost/pgzip v1.2.5 // indirect
-	github.com/lxc/lxd v0.0.0-20210322210645-afff9e5620d6
+	github.com/lxc/lxd v0.0.0-20210626035152-24a1b4c5eecc
 	github.com/mudler/docker-companion v0.4.6-0.20201209184016-2d26fc9143d4
 	github.com/openSUSE/umoci v0.4.5 // indirect
 	github.com/pborman/uuid v1.2.1 // indirect
@@ -33,7 +33,8 @@ require (
 	github.com/vbatts/go-mtree v0.5.0 // indirect
 	go.opencensus.io v0.23.0 // indirect
 	go.uber.org/multierr v1.6.0 // indirect
-	go.uber.org/zap v1.16.0
+	go.uber.org/tools v0.0.0-20190618225709-2cfd321de3ee // indirect
+	go.uber.org/zap v1.17.0
 	golang.org/x/crypto v0.0.0-20210322153248-0c34fe9e7dc2 // indirect
 	golang.org/x/lint v0.0.0-20201208152925-83fdc39ff7b5 // indirect
 	golang.org/x/net v0.0.0-20210316092652-d523dce5a7f4 // indirect

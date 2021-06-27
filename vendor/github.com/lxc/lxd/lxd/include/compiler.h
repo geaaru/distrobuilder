@@ -25,8 +25,6 @@
 #define _GNU_SOURCE 1
 #endif
 
-#include "config.h"
-
 #ifndef thread_local
 #if __STDC_VERSION__ >= 201112L &&    \
     !(defined(__STDC_NO_THREADS__) || \
@@ -59,6 +57,23 @@
 #	define __hot __attribute__((hot))
 #endif
 
+#ifndef __unused
+#	define __unused __attribute__((unused))
+#endif
+
+/*
+ * __ro_after_init is used to mark things that are read-only after init (i.e.
+ * after mark_rodata_ro() has been called). These are effectively read-only,
+ * but may get written to during init, so can't live in .rodata (via "const").
+ */
+#ifndef __ro_after_init
+#     define __ro_after_init __attribute__((__section__(".data..ro_after_init")))
+#endif
+
 #define __cgfsng_ops
+
+#ifndef __returns_twice
+#define __returns_twice __attribute__((returns_twice))
+#endif
 
 #endif /* __LXC_COMPILER_H */

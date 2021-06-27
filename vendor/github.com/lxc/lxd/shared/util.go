@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	"encoding/gob"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"hash"
 	"io"
@@ -33,7 +32,7 @@ import (
 )
 
 const SnapshotDelimiter = "/"
-const DefaultPort = "8443"
+const DefaultPort = 8443
 
 // URLEncode encodes a path and query parameters to a URL.
 func URLEncode(path string, query map[string]string) (string, error) {
@@ -106,6 +105,57 @@ func IsUnixSocket(path string) bool {
 	return (stat.Mode() & os.ModeSocket) == os.ModeSocket
 }
 
+// HostPathFollow takes a valid path (from HostPath) and resolves it
+// all the way to its target or to the last which can be resolved.
+func HostPathFollow(path string) string {
+	// Ignore empty paths
+	if len(path) == 0 {
+		return path
+	}
+
+	// Don't prefix stdin/stdout
+	if path == "-" {
+		return path
+	}
+
+	// Check if we're running in a snap package.
+	if !InSnap() {
+		return path
+	}
+
+	// Handle relative paths
+	if path[0] != os.PathSeparator {
+		// Use the cwd of the parent as snap-confine alters our own cwd on launch
+		ppid := os.Getppid()
+		if ppid < 1 {
+			return path
+		}
+
+		pwd, err := os.Readlink(fmt.Sprintf("/proc/%d/cwd", ppid))
+		if err != nil {
+			return path
+		}
+
+		path = filepath.Clean(strings.Join([]string{pwd, path}, string(os.PathSeparator)))
+	}
+
+	// Rely on "readlink -m" to do the right thing.
+	path = HostPath(path)
+	for {
+		target, err := RunCommand("readlink", "-m", path)
+		if err != nil {
+			return path
+		}
+		target = strings.TrimSpace(target)
+
+		if path == HostPath(target) {
+			return path
+		}
+
+		path = HostPath(target)
+	}
+}
+
 // HostPath returns the host path for the provided path
 // On a normal system, this does nothing
 // When inside of a snap environment, returns the real path
@@ -121,9 +171,7 @@ func HostPath(path string) string {
 	}
 
 	// Check if we're running in a snap package
-	_, inSnap := os.LookupEnv("SNAP")
-	snapName := os.Getenv("SNAP_NAME")
-	if !inSnap || snapName != "lxd" {
+	if !InSnap() {
 		return path
 	}
 
@@ -232,15 +280,6 @@ func ParseLXDFileHeaders(headers http.Header) (uid int64, gid int64, mode int, t
 	return uid, gid, mode, type_, write
 }
 
-func ReadToJSON(r io.Reader, req interface{}) error {
-	buf, err := ioutil.ReadAll(r)
-	if err != nil {
-		return err
-	}
-
-	return json.Unmarshal(buf, req)
-}
-
 func ReaderToChannel(r io.Reader, bufferSize int) <-chan []byte {
 	if bufferSize <= 128*1024 {
 		bufferSize = 128 * 1024
@@ -328,6 +367,34 @@ func WriteAll(w io.Writer, data []byte) error {
 	}
 }
 
+// QuotaWriter returns an error once a given write quota gets exceeded.
+type QuotaWriter struct {
+	writer io.Writer
+	quota  int64
+	n      int64
+}
+
+// NewQuotaWriter returns a new QuotaWriter wrapping the given writer.
+//
+// If the given quota is negative, then no quota is applied.
+func NewQuotaWriter(writer io.Writer, quota int64) *QuotaWriter {
+	return &QuotaWriter{
+		writer: writer,
+		quota:  quota,
+	}
+}
+
+// Write implements the Writer interface.
+func (w *QuotaWriter) Write(p []byte) (n int, err error) {
+	if w.quota >= 0 {
+		w.n += int64(len(p))
+		if w.n > w.quota {
+			return 0, fmt.Errorf("reached %d bytes, exceeding quota of %d", w.n, w.quota)
+		}
+	}
+	return w.writer.Write(p)
+}
+
 // FileMove tries to move a file by using os.Rename,
 // if that fails it tries to copy the file and remove the source.
 func FileMove(oldPath string, newPath string) error {
@@ -353,7 +420,7 @@ func FileCopy(source string, dest string) error {
 		return err
 	}
 
-	var d *os.File
+	_, uid, gid := GetOwnerMode(fi)
 
 	if fi.Mode()&os.ModeSymlink != 0 {
 		target, err := os.Readlink(source)
@@ -373,40 +440,39 @@ func FileCopy(source string, dest string) error {
 			return err
 		}
 
-		d, err = os.OpenFile(dest, os.O_WRONLY, fi.Mode())
-		if err != nil {
-			return err
+		if runtime.GOOS != "windows" {
+			return os.Lchown(dest, uid, gid)
 		}
-		defer d.Close()
-	} else {
-		s, err := os.Open(source)
-		if err != nil {
-			return err
-		}
-		defer s.Close()
 
-		d, err = os.Create(dest)
-		if err != nil {
-			if os.IsExist(err) {
-				d, err = os.OpenFile(dest, os.O_WRONLY, fi.Mode())
-				if err != nil {
-					return err
-				}
-			} else {
+		return nil
+	}
+
+	s, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+
+	d, err := os.Create(dest)
+	if err != nil {
+		if os.IsExist(err) {
+			d, err = os.OpenFile(dest, os.O_WRONLY, fi.Mode())
+			if err != nil {
 				return err
 			}
-		}
-		defer d.Close()
-
-		_, err = io.Copy(d, s)
-		if err != nil {
+		} else {
 			return err
 		}
+	}
+	defer d.Close()
+
+	_, err = io.Copy(d, s)
+	if err != nil {
+		return err
 	}
 
 	/* chown not supported on windows */
 	if runtime.GOOS != "windows" {
-		_, uid, gid := GetOwnerMode(fi)
 		return d.Chown(uid, gid)
 	}
 
@@ -484,10 +550,6 @@ func IsSnapshot(name string) bool {
 	return strings.Contains(name, SnapshotDelimiter)
 }
 
-func ExtractSnapshotName(name string) string {
-	return strings.SplitN(name, SnapshotDelimiter, 2)[1]
-}
-
 func MkdirAllOwner(path string, perm os.FileMode, uid int, gid int) error {
 	// This function is a slightly modified version of MkdirAll from the Go standard library.
 	// https://golang.org/src/os/path.go?s=488:535#L9
@@ -549,6 +611,16 @@ func StringInSlice(key string, list []string) bool {
 	return false
 }
 
+// StringHasPrefix returns true if value has one of the supplied prefixes.
+func StringHasPrefix(value string, prefixes ...string) bool {
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(value, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func IntInSlice(key int, list []int) bool {
 	for _, entry := range list {
 		if entry == key {
@@ -567,12 +639,21 @@ func Int64InSlice(key int64, list []int64) bool {
 	return false
 }
 
-func IsTrue(value string) bool {
-	if StringInSlice(strings.ToLower(value), []string{"true", "1", "yes", "on"}) {
-		return true
+func Uint64InSlice(key uint64, list []uint64) bool {
+	for _, entry := range list {
+		if entry == key {
+			return true
+		}
 	}
-
 	return false
+}
+
+func IsTrue(value string) bool {
+	return StringInSlice(strings.ToLower(value), []string{"true", "1", "yes", "on"})
+}
+
+func IsUserConfig(key string) bool {
+	return strings.HasPrefix(key, "user.")
 }
 
 // StringMapHasStringKey returns true if any of the supplied keys are present in the map.
@@ -652,33 +733,34 @@ func RunningInUserNS() bool {
 	return true
 }
 
-func ValidHostname(name string) bool {
+// ValidHostname checks the string is valid DNS hostname.
+func ValidHostname(name string) error {
 	// Validate length
 	if len(name) < 1 || len(name) > 63 {
-		return false
+		return fmt.Errorf("Name must be 1-63 characters long")
 	}
 
 	// Validate first character
 	if strings.HasPrefix(name, "-") {
-		return false
+		return fmt.Errorf(`Name must not start with "-" character`)
 	}
 
 	if _, err := strconv.Atoi(string(name[0])); err == nil {
-		return false
+		return fmt.Errorf("Name must not be a number")
 	}
 
 	// Validate last character
 	if strings.HasSuffix(name, "-") {
-		return false
+		return fmt.Errorf(`Name must not end with "-" character`)
 	}
 
 	// Validate the character set
 	match, _ := regexp.MatchString("^[-a-zA-Z0-9]*$", name)
 	if !match {
-		return false
+		return fmt.Errorf("Name can only contain alphanumeric and hyphen characters")
 	}
 
-	return true
+	return nil
 }
 
 // Spawn the editor with a temporary YAML file for editing configs
@@ -797,11 +879,15 @@ func (e RunError) Error() string {
 // resulting stdout and stderr output as separate variables. If the supplied environment is nil then
 // the default environment is used. If the command fails to start or returns a non-zero exit code
 // then an error is returned containing the output of stderr too.
-func RunCommandSplit(env []string, name string, arg ...string) (string, string, error) {
+func RunCommandSplit(env []string, filesInherit []*os.File, name string, arg ...string) (string, string, error) {
 	cmd := exec.Command(name, arg...)
 
 	if env != nil {
 		cmd.Env = env
+	}
+
+	if filesInherit != nil {
+		cmd.ExtraFiles = filesInherit
 	}
 
 	var stdout bytes.Buffer
@@ -812,21 +898,30 @@ func RunCommandSplit(env []string, name string, arg ...string) (string, string, 
 	err := cmd.Run()
 	if err != nil {
 		err := RunError{
-			msg:    fmt.Sprintf("Failed to run: %s %s: %s", name, strings.Join(arg, " "), strings.TrimSpace(string(stderr.Bytes()))),
-			Stdout: string(stdout.Bytes()),
-			Stderr: string(stderr.Bytes()),
+			msg:    fmt.Sprintf("Failed to run: %s %s: %s", name, strings.Join(arg, " "), strings.TrimSpace(stderr.String())),
+			Stdout: stdout.String(),
+			Stderr: stderr.String(),
 			Err:    err,
 		}
-		return string(stdout.Bytes()), string(stderr.Bytes()), err
+		return stdout.String(), stderr.String(), err
 	}
 
-	return string(stdout.Bytes()), string(stderr.Bytes()), nil
+	return stdout.String(), stderr.String(), nil
 }
 
 // RunCommand runs a command with optional arguments and returns stdout. If the command fails to
 // start or returns a non-zero exit code then an error is returned containing the output of stderr.
 func RunCommand(name string, arg ...string) (string, error) {
-	stdout, _, err := RunCommandSplit(nil, name, arg...)
+	stdout, _, err := RunCommandSplit(nil, nil, name, arg...)
+	return stdout, err
+}
+
+// RunCommandInheritFds runs a command with optional arguments and passes a set
+// of file descriptors to the newly created process, returning stdout. If the
+// command fails to start or returns a non-zero exit code then an error is
+// returned containing the output of stderr.
+func RunCommandInheritFds(filesInherit []*os.File, name string, arg ...string) (string, error) {
+	stdout, _, err := RunCommandSplit(nil, filesInherit, name, arg...)
 	return stdout, err
 }
 
@@ -834,7 +929,7 @@ func RunCommand(name string, arg ...string) (string, error) {
 // returns stdout. If the command fails to start or returns a non-zero exit code then an error is
 // returned containing the output of stderr.
 func RunCommandCLocale(name string, arg ...string) (string, error) {
-	stdout, _, err := RunCommandSplit(append(os.Environ(), "LANG=C.UTF-8"), name, arg...)
+	stdout, _, err := RunCommandSplit(append(os.Environ(), "LANG=C.UTF-8"), nil, name, arg...)
 	return stdout, err
 }
 
@@ -857,7 +952,8 @@ func RunCommandWithFds(stdin io.Reader, stdout io.Writer, name string, arg ...st
 		err := RunError{
 			msg: fmt.Sprintf("Failed to run: %s %s: %s", name, strings.Join(arg, " "),
 				strings.TrimSpace(buffer.String())),
-			Err: err,
+			Err:    err,
+			Stderr: buffer.String(),
 		}
 
 		return err
@@ -866,6 +962,8 @@ func RunCommandWithFds(stdin io.Reader, stdout io.Writer, name string, arg ...st
 	return nil
 }
 
+// TryRunCommand runs the specified command up to 20 times with a 500ms delay between each call
+// until it runs without an error. If after 20 times it is still failing then returns the error.
 func TryRunCommand(name string, arg ...string) (string, error) {
 	var err error
 	var output string
@@ -892,18 +990,6 @@ func TimeIsSet(ts time.Time) bool {
 	}
 
 	return true
-}
-
-// WriteTempFile creates a temp file with the specified content
-func WriteTempFile(dir string, prefix string, content string) (string, error) {
-	f, err := ioutil.TempFile(dir, prefix)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	_, err = f.WriteString(content)
-	return f.Name(), err
 }
 
 // EscapePathFstab escapes a path fstab-style.
@@ -1117,4 +1203,26 @@ func GetSnapshotExpiry(refDate time.Time, s string) (time.Time, error) {
 		time.Hour*time.Duration(expiry["H"]) + time.Minute*time.Duration(expiry["M"]))
 
 	return t, nil
+}
+
+// InSnap returns true if we're running inside the LXD snap.
+func InSnap() bool {
+	// Detect the snap.
+	_, snapPath := os.LookupEnv("SNAP")
+	snapName := os.Getenv("SNAP_NAME")
+	if snapPath && snapName == "lxd" {
+		return true
+	}
+
+	return false
+}
+
+// JoinUrlPath return the join of the input urls/paths sanitized.
+func JoinUrls(baseUrl, p string) (string, error) {
+	u, err := url.Parse(baseUrl)
+	if err != nil {
+		return "", err
+	}
+	u.Path = path.Join(u.Path, p)
+	return u.String(), nil
 }

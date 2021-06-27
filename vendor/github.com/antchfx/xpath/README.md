@@ -138,12 +138,15 @@ Supported Features
 `lang()`| ✗ |
 `last()`| ✓ |
 `local-name()`| ✓ |
+`matches()`| ✓ |
 `name()`| ✓ |
 `namespace-uri()`| ✓ |
 `normalize-space()`| ✓ |
 `not()`| ✓ |
 `number()`| ✓ |
 `position()`| ✓ |
+`replace()`| ✓ |
+`reverse()`| ✓ |
 `round()`| ✓ |
 `starts-with()`| ✓ |
 `string()`| ✓ |
