@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 )
@@ -11,9 +12,9 @@ import (
 //
 //   - always: the docker daemon will always restart the container
 //   - on-failure: the docker daemon will restart the container on failures, at
-//                 most MaximumRetryCount times
+//     most MaximumRetryCount times
 //   - unless-stopped: the docker daemon will always restart the container except
-//                 when user has manually stopped the container
+//     when user has manually stopped the container
 //   - no: the docker daemon will not restart the container automatically
 type RestartPolicy struct {
 	Name              string `json:"Name,omitempty" yaml:"Name,omitempty" toml:"Name,omitempty"`
@@ -52,7 +53,8 @@ func (c *Client) RestartContainer(id string, timeout uint) error {
 	path := fmt.Sprintf("/containers/%s/restart?t=%d", id, timeout)
 	resp, err := c.do(http.MethodPost, path, doOptions{})
 	if err != nil {
-		if e, ok := err.(*Error); ok && e.Status == http.StatusNotFound {
+		var e *Error
+		if errors.As(err, &e) && e.Status == http.StatusNotFound {
 			return &NoSuchContainer{ID: id}
 		}
 		return err

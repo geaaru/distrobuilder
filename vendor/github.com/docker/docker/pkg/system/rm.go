@@ -1,3 +1,6 @@
+//go:build !darwin && !windows
+// +build !darwin,!windows
+
 package system // import "github.com/docker/docker/pkg/system"
 
 import (

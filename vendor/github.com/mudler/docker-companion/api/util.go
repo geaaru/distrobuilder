@@ -6,12 +6,12 @@ import (
 	"io"
 	"os"
 
-	"github.com/codegangsta/cli"
 	archive "github.com/containerd/containerd/archive"
 	dockerarchive "github.com/docker/docker/pkg/archive"
 	docker "github.com/fsouza/go-dockerclient"
-	layer "github.com/openSUSE/umoci/oci/layer"
+	layer "github.com/opencontainers/umoci/oci/layer"
 	jww "github.com/spf13/jwalterweatherman"
+	"github.com/urfave/cli"
 )
 
 type ExtractOpts struct {
@@ -40,7 +40,7 @@ func ExtractLayer(opts *ExtractOpts) error {
 	buf := bufio.NewReader(r)
 	switch opts.UnpackMode {
 	case "umoci": // more fixes are in there
-		return layer.UnpackLayer(opts.Destination, buf, &layer.MapOptions{KeepDirlinks: opts.KeepDirlinks, Rootless: opts.Rootless})
+		return layer.UnpackLayer(opts.Destination, buf, &layer.UnpackOptions{KeepDirlinks: opts.KeepDirlinks, MapOptions: layer.MapOptions{Rootless: opts.Rootless}})
 	case "containerd": // more cross-compatible
 		_, err := archive.Apply(context.Background(), opts.Destination, buf)
 		return err

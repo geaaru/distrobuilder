@@ -1,21 +1,22 @@
 package shared
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/pkg/errors"
-	"gopkg.in/robfig/cron.v2"
-
+	"github.com/lxc/lxd/lxd/instance/instancetype"
 	"github.com/lxc/lxd/shared/units"
 	"github.com/lxc/lxd/shared/validate"
 )
 
+// InstanceAction indicates the type of action being performed.
 type InstanceAction string
 
+// InstanceAction types.
 const (
 	Stop     InstanceAction = "stop"
 	Start    InstanceAction = "start"
@@ -24,8 +25,11 @@ const (
 	Unfreeze InstanceAction = "unfreeze"
 )
 
+// ConfigVolatilePrefix indicates the prefix used for volatile config keys.
+const ConfigVolatilePrefix = "volatile."
+
 // IsRootDiskDevice returns true if the given device representation is configured as root disk for
-// a container. It typically get passed a specific entry of api.Instance.Devices.
+// an instance. It typically get passed a specific entry of api.Instance.Devices.
 func IsRootDiskDevice(device map[string]string) bool {
 	// Root disk devices also need a non-empty "pool" property, but we can't check that here
 	// because this function is used with clients talking to older servers where there was no
@@ -38,7 +42,11 @@ func IsRootDiskDevice(device map[string]string) bool {
 	return false
 }
 
-// GetRootDiskDevice returns the container device that is configured as root disk
+// ErrNoRootDisk means there is no root disk device found.
+var ErrNoRootDisk = fmt.Errorf("No root device could be found")
+
+// GetRootDiskDevice returns the instance device that is configured as root disk.
+// Returns the device name and device config map.
 func GetRootDiskDevice(devices map[string]map[string]string) (string, map[string]string, error) {
 	var devName string
 	var dev map[string]string
@@ -58,7 +66,7 @@ func GetRootDiskDevice(devices map[string]map[string]string) (string, map[string
 		return devName, dev, nil
 	}
 
-	return "", nil, fmt.Errorf("No root device could be found")
+	return "", nil, ErrNoRootDisk
 }
 
 // HugePageSizeKeys is a list of known hugepage size configuration keys.
@@ -67,15 +75,19 @@ var HugePageSizeKeys = [...]string{"limits.hugepages.64KB", "limits.hugepages.1M
 // HugePageSizeSuffix contains the list of known hugepage size suffixes.
 var HugePageSizeSuffix = [...]string{"64KB", "1MB", "2MB", "1GB"}
 
-// KnownInstanceConfigKeys maps all fully defined, well-known config keys
-// to an appropriate checker function, which validates whether or not a
-// given value is syntactically legal.
-var KnownInstanceConfigKeys = map[string]func(value string) error{
+// InstanceConfigKeysAny is a map of config key to validator. (keys applying to containers AND virtual machines).
+var InstanceConfigKeysAny = map[string]func(value string) error{
 	"boot.autostart":             validate.Optional(validate.IsBool),
 	"boot.autostart.delay":       validate.Optional(validate.IsInt64),
 	"boot.autostart.priority":    validate.Optional(validate.IsInt64),
 	"boot.stop.priority":         validate.Optional(validate.IsInt64),
 	"boot.host_shutdown_timeout": validate.Optional(validate.IsInt64),
+
+	"cloud-init.network-config": validate.Optional(validate.IsAny),
+	"cloud-init.user-data":      validate.Optional(validate.IsAny),
+	"cloud-init.vendor-data":    validate.Optional(validate.IsAny),
+
+	"cluster.evacuate": validate.Optional(validate.IsOneOf("auto", "migrate", "live-migrate", "stop")),
 
 	"limits.cpu": func(value string) error {
 		if value == "" {
@@ -100,6 +112,74 @@ var KnownInstanceConfigKeys = map[string]func(value string) error{
 
 		return nil
 	},
+	"limits.disk.priority": validate.Optional(validate.IsPriority),
+	"limits.memory": func(value string) error {
+		if value == "" {
+			return nil
+		}
+
+		if strings.HasSuffix(value, "%") {
+			num, err := strconv.ParseInt(strings.TrimSuffix(value, "%"), 10, 64)
+			if err != nil {
+				return err
+			}
+
+			if num == 0 {
+				return errors.New("Memory limit can't be 0%")
+			}
+
+			return nil
+		}
+
+		num, err := units.ParseByteSizeString(value)
+		if err != nil {
+			return err
+		}
+
+		if num == 0 {
+			return fmt.Errorf("Memory limit can't be 0")
+		}
+
+		return nil
+	},
+	"limits.network.priority": validate.Optional(validate.IsPriority),
+
+	// Caller is responsible for full validation of any raw.* value.
+	"raw.apparmor": validate.IsAny,
+
+	"security.devlxd":            validate.Optional(validate.IsBool),
+	"security.protection.delete": validate.Optional(validate.IsBool),
+
+	"snapshots.schedule":         validate.Optional(validate.IsCron([]string{"@hourly", "@daily", "@midnight", "@weekly", "@monthly", "@annually", "@yearly", "@startup", "@never"})),
+	"snapshots.schedule.stopped": validate.Optional(validate.IsBool),
+	"snapshots.pattern":          validate.IsAny,
+	"snapshots.expiry": func(value string) error {
+		// Validate expression
+		_, err := GetSnapshotExpiry(time.Time{}, value)
+		return err
+	},
+
+	// Volatile keys.
+	"volatile.apply_template":         validate.IsAny,
+	"volatile.base_image":             validate.IsAny,
+	"volatile.cloud-init.instance-id": validate.Optional(validate.IsUUID),
+	"volatile.evacuate.origin":        validate.IsAny,
+	"volatile.last_state.idmap":       validate.IsAny,
+	"volatile.last_state.power":       validate.IsAny,
+	"volatile.last_state.ready":       validate.IsBool,
+	"volatile.idmap.base":             validate.IsAny,
+	"volatile.idmap.current":          validate.IsAny,
+	"volatile.idmap.next":             validate.IsAny,
+	"volatile.apply_quota":            validate.IsAny,
+	"volatile.uuid":                   validate.Optional(validate.IsUUID),
+	"volatile.vsock_id":               validate.Optional(validate.IsInt64),
+
+	// Caller is responsible for full validation of any raw.* value.
+	"raw.idmap": validate.IsAny,
+}
+
+// InstanceConfigKeysContainer is a map of config key to validator. (keys applying to containers only).
+var InstanceConfigKeysContainer = map[string]func(value string) error{
 	"limits.cpu.allowance": func(value string) error {
 		if value == "" {
 			return nil
@@ -133,46 +213,16 @@ var KnownInstanceConfigKeys = map[string]func(value string) error{
 
 		return nil
 	},
-	"limits.cpu.priority": validate.Optional(validate.IsPriority),
-
-	"limits.disk.priority": validate.Optional(validate.IsPriority),
-
+	"limits.cpu.priority":   validate.Optional(validate.IsPriority),
 	"limits.hugepages.64KB": validate.Optional(validate.IsSize),
 	"limits.hugepages.1MB":  validate.Optional(validate.IsSize),
 	"limits.hugepages.2MB":  validate.Optional(validate.IsSize),
 	"limits.hugepages.1GB":  validate.Optional(validate.IsSize),
+	"limits.memory.enforce": validate.Optional(validate.IsOneOf("soft", "hard")),
 
-	"limits.memory": func(value string) error {
-		if value == "" {
-			return nil
-		}
-
-		if strings.HasSuffix(value, "%") {
-			_, err := strconv.ParseInt(strings.TrimSuffix(value, "%"), 10, 64)
-			if err != nil {
-				return err
-			}
-
-			return nil
-		}
-
-		_, err := units.ParseByteSizeString(value)
-		if err != nil {
-			return err
-		}
-
-		return nil
-	},
-	"limits.memory.enforce": func(value string) error {
-		return validate.IsOneOf(value, []string{"soft", "hard"})
-	},
 	"limits.memory.swap":          validate.Optional(validate.IsBool),
 	"limits.memory.swap.priority": validate.Optional(validate.IsPriority),
-	"limits.memory.hugepages":     validate.Optional(validate.IsBool),
-
-	"limits.network.priority": validate.Optional(validate.IsPriority),
-
-	"limits.processes": validate.Optional(validate.IsInt64),
+	"limits.processes":            validate.Optional(validate.IsInt64),
 
 	"linux.kernel_modules": validate.IsAny,
 
@@ -185,77 +235,56 @@ var KnownInstanceConfigKeys = map[string]func(value string) error{
 	"nvidia.require.cuda":        validate.IsAny,
 	"nvidia.require.driver":      validate.IsAny,
 
-	"security.nesting":       validate.Optional(validate.IsBool),
-	"security.privileged":    validate.Optional(validate.IsBool),
-	"security.devlxd":        validate.Optional(validate.IsBool),
-	"security.devlxd.images": validate.Optional(validate.IsBool),
+	// Caller is responsible for full validation of any raw.* value.
+	"raw.lxc":     validate.IsAny,
+	"raw.seccomp": validate.IsAny,
 
-	"security.protection.delete": validate.Optional(validate.IsBool),
-	"security.protection.shift":  validate.Optional(validate.IsBool),
+	"security.devlxd.images": validate.Optional(validate.IsBool),
 
 	"security.idmap.base":     validate.Optional(validate.IsUint32),
 	"security.idmap.isolated": validate.Optional(validate.IsBool),
 	"security.idmap.size":     validate.Optional(validate.IsUint32),
 
-	"security.secureboot": validate.Optional(validate.IsBool),
+	"security.nesting":          validate.Optional(validate.IsBool),
+	"security.privileged":       validate.Optional(validate.IsBool),
+	"security.protection.shift": validate.Optional(validate.IsBool),
 
-	"security.syscalls.allow":                   validate.IsAny,
-	"security.syscalls.blacklist_default":       validate.Optional(validate.IsBool),
-	"security.syscalls.blacklist_compat":        validate.Optional(validate.IsBool),
-	"security.syscalls.blacklist":               validate.IsAny,
-	"security.syscalls.deny_default":            validate.Optional(validate.IsBool),
-	"security.syscalls.deny_compat":             validate.Optional(validate.IsBool),
-	"security.syscalls.deny":                    validate.IsAny,
-	"security.syscalls.intercept.bpf":           validate.Optional(validate.IsBool),
-	"security.syscalls.intercept.bpf.devices":   validate.Optional(validate.IsBool),
-	"security.syscalls.intercept.mknod":         validate.Optional(validate.IsBool),
-	"security.syscalls.intercept.mount":         validate.Optional(validate.IsBool),
-	"security.syscalls.intercept.mount.allowed": validate.IsAny,
-	"security.syscalls.intercept.mount.fuse":    validate.IsAny,
-	"security.syscalls.intercept.mount.shift":   validate.Optional(validate.IsBool),
-	"security.syscalls.intercept.setxattr":      validate.Optional(validate.IsBool),
-	"security.syscalls.whitelist":               validate.IsAny,
+	"security.syscalls.allow":                        validate.IsAny,
+	"security.syscalls.blacklist_default":            validate.Optional(validate.IsBool),
+	"security.syscalls.blacklist_compat":             validate.Optional(validate.IsBool),
+	"security.syscalls.blacklist":                    validate.IsAny,
+	"security.syscalls.deny_default":                 validate.Optional(validate.IsBool),
+	"security.syscalls.deny_compat":                  validate.Optional(validate.IsBool),
+	"security.syscalls.deny":                         validate.IsAny,
+	"security.syscalls.intercept.bpf":                validate.Optional(validate.IsBool),
+	"security.syscalls.intercept.bpf.devices":        validate.Optional(validate.IsBool),
+	"security.syscalls.intercept.mknod":              validate.Optional(validate.IsBool),
+	"security.syscalls.intercept.mount":              validate.Optional(validate.IsBool),
+	"security.syscalls.intercept.mount.allowed":      validate.IsAny,
+	"security.syscalls.intercept.mount.fuse":         validate.IsAny,
+	"security.syscalls.intercept.mount.shift":        validate.Optional(validate.IsBool),
+	"security.syscalls.intercept.sched_setscheduler": validate.Optional(validate.IsBool),
+	"security.syscalls.intercept.setxattr":           validate.Optional(validate.IsBool),
+	"security.syscalls.intercept.sysinfo":            validate.Optional(validate.IsBool),
+	"security.syscalls.whitelist":                    validate.IsAny,
+}
 
-	"snapshots.schedule": func(value string) error {
-		if value == "" {
-			return nil
-		}
+// InstanceConfigKeysVM is a map of config key to validator. (keys applying to VM only).
+var InstanceConfigKeysVM = map[string]func(value string) error{
+	"limits.memory.hugepages": validate.Optional(validate.IsBool),
 
-		if len(strings.Split(value, " ")) != 5 {
-			return fmt.Errorf("Schedule must be of the form: <minute> <hour> <day-of-month> <month> <day-of-week>")
-		}
+	"migration.stateful": validate.Optional(validate.IsBool),
 
-		_, err := cron.Parse(fmt.Sprintf("* %s", value))
-		if err != nil {
-			return errors.Wrap(err, "Error parsing schedule")
-		}
+	// Caller is responsible for full validation of any raw.* value.
+	"raw.qemu":      validate.IsAny,
+	"raw.qemu.conf": validate.IsAny,
 
-		return nil
-	},
-	"snapshots.schedule.stopped": validate.Optional(validate.IsBool),
-	"snapshots.pattern":          validate.IsAny,
-	"snapshots.expiry": func(value string) error {
-		// Validate expression
-		_, err := GetSnapshotExpiry(time.Time{}, value)
-		return err
-	},
+	"security.agent.metrics": validate.Optional(validate.IsBool),
+	"security.secureboot":    validate.Optional(validate.IsBool),
 
-	// Caller is responsible for full validation of any raw.* value
-	"raw.apparmor": validate.IsAny,
-	"raw.idmap":    validate.IsAny,
-	"raw.lxc":      validate.IsAny,
-	"raw.qemu":     validate.IsAny,
-	"raw.seccomp":  validate.IsAny,
+	"agent.nic_config": validate.Optional(validate.IsBool),
 
-	"volatile.apply_template":   validate.IsAny,
-	"volatile.base_image":       validate.IsAny,
-	"volatile.last_state.idmap": validate.IsAny,
-	"volatile.last_state.power": validate.IsAny,
-	"volatile.idmap.base":       validate.IsAny,
-	"volatile.idmap.current":    validate.IsAny,
-	"volatile.idmap.next":       validate.IsAny,
-	"volatile.apply_quota":      validate.IsAny,
-	"volatile.uuid":             validate.Optional(validate.IsUUID),
+	"volatile.apply_nvram": validate.Optional(validate.IsBool),
 }
 
 // ConfigKeyChecker returns a function that will check whether or not
@@ -264,12 +293,27 @@ var KnownInstanceConfigKeys = map[string]func(value string) error{
 // syntactic checking of the value, semantic and usage checking must
 // be done by the caller.  User defined keys are always considered to
 // be valid, e.g. user.* and environment.* keys.
-func ConfigKeyChecker(key string) (func(value string) error, error) {
-	if f, ok := KnownInstanceConfigKeys[key]; ok {
+func ConfigKeyChecker(key string, instanceType instancetype.Type) (func(value string) error, error) {
+	f, ok := InstanceConfigKeysAny[key]
+	if ok {
 		return f, nil
 	}
 
-	if strings.HasPrefix(key, "volatile.") {
+	if instanceType == instancetype.Any || instanceType == instancetype.Container {
+		f, ok := InstanceConfigKeysContainer[key]
+		if ok {
+			return f, nil
+		}
+	}
+
+	if instanceType == instancetype.Any || instanceType == instancetype.VM {
+		f, ok := InstanceConfigKeysVM[key]
+		if ok {
+			return f, nil
+		}
+	}
+
+	if strings.HasPrefix(key, ConfigVolatilePrefix) {
 		if strings.HasSuffix(key, ".hwaddr") {
 			return validate.IsAny, nil
 		}
@@ -302,6 +346,10 @@ func ConfigKeyChecker(key string) (func(value string) error, error) {
 			return validate.IsAny, nil
 		}
 
+		if strings.HasSuffix(key, ".last_state.vf.parent") {
+			return validate.IsAny, nil
+		}
+
 		if strings.HasSuffix(key, ".apply_quota") {
 			return validate.IsAny, nil
 		}
@@ -312,6 +360,14 @@ func ConfigKeyChecker(key string) (func(value string) error, error) {
 
 		if strings.HasSuffix(key, ".driver") {
 			return validate.IsAny, nil
+		}
+
+		if strings.HasSuffix(key, ".uuid") {
+			return validate.IsAny, nil
+		}
+
+		if strings.HasSuffix(key, ".last_state.ready") {
+			return validate.IsBool, nil
 		}
 	}
 
@@ -332,16 +388,28 @@ func ConfigKeyChecker(key string) (func(value string) error, error) {
 		return validate.IsAny, nil
 	}
 
+	if (instanceType == instancetype.Any || instanceType == instancetype.Container) &&
+		strings.HasPrefix(key, "linux.sysctl.") {
+		return validate.IsAny, nil
+	}
+
 	return nil, fmt.Errorf("Unknown configuration key: %s", key)
 }
 
-// InstanceGetParentAndSnapshotName returns the parent instance name, snapshot name,
-// and whether it actually was a snapshot name.
-func InstanceGetParentAndSnapshotName(name string) (string, string, bool) {
-	fields := strings.SplitN(name, SnapshotDelimiter, 2)
-	if len(fields) == 1 {
-		return name, "", false
+// InstanceIncludeWhenCopying is used to decide whether to include a config item or not when copying an instance.
+// The remoteCopy argument indicates if the copy is remote (i.e between LXD nodes) as this affects the keys kept.
+func InstanceIncludeWhenCopying(configKey string, remoteCopy bool) bool {
+	if configKey == "volatile.base_image" {
+		return true // Include volatile.base_image always as it can help optimize copies.
 	}
 
-	return fields[0], fields[1], true
+	if configKey == "volatile.last_state.idmap" && !remoteCopy {
+		return true // Include volatile.last_state.idmap when doing local copy to avoid needless remapping.
+	}
+
+	if strings.HasPrefix(configKey, ConfigVolatilePrefix) {
+		return false // Exclude all other volatile keys.
+	}
+
+	return true // Keep all other keys.
 }

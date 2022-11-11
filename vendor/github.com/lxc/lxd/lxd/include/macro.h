@@ -34,6 +34,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
+#include <sys/wait.h>
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -268,6 +269,13 @@ enum {
 		__internal_ret__;                             \
 	})
 
+#define log_errno(__ret__, format, ...)                       \
+	({                                                    \
+		typeof(__ret__) __internal_ret__ = (__ret__); \
+		fprintf(stderr, "%m - " format "\n", ##__VA_ARGS__);  \
+		__internal_ret__;                             \
+	})
+
 #ifndef P_PIDFD
 #define P_PIDFD 3
 #endif
@@ -281,5 +289,53 @@ enum {
 #ifndef CLONE_NEWCGROUP
 #define CLONE_NEWCGROUP	0x02000000
 #endif
+
+#define BUILD_BUG_ON_ZERO(e) ((int)(sizeof(struct { int:(-!!(e)); })))
+
+/*
+ * Compile time versions of __arch_hweightN()
+ */
+#define __const_hweight8(w)		\
+	((unsigned int)			\
+	 ((!!((w) & (1ULL << 0))) +	\
+	  (!!((w) & (1ULL << 1))) +	\
+	  (!!((w) & (1ULL << 2))) +	\
+	  (!!((w) & (1ULL << 3))) +	\
+	  (!!((w) & (1ULL << 4))) +	\
+	  (!!((w) & (1ULL << 5))) +	\
+	  (!!((w) & (1ULL << 6))) +	\
+	  (!!((w) & (1ULL << 7)))))
+
+#define __const_hweight16(w) (__const_hweight8(w)  + __const_hweight8((w)  >> 8 ))
+#define __const_hweight32(w) (__const_hweight16(w) + __const_hweight16((w) >> 16))
+#define __const_hweight64(w) (__const_hweight32(w) + __const_hweight32((w) >> 32))
+
+#define hweight8(w) __const_hweight8(w)
+#define hweight16(w) __const_hweight16(w)
+#define hweight32(w) __const_hweight32(w)
+#define hweight64(w) __const_hweight64(w)
+
+/*
+ * /proc/           = 6
+ *                  +
+ * <pid-as_str>     = INTTYPE_TO_STRLEN(pid_t)
+ *                  +
+ * /.id_map         = 8
+ *                  +
+ * \0               = 1
+ */
+#define PROC_PID_IDMAP_LEN (6 + INTTYPE_TO_STRLEN(pid_t) + 8 + 1)
+
+#define strnprintf(buf, buf_size, ...)                                                    \
+	({                                                                                \
+		int __ret_strnprintf;                                                     \
+		__ret_strnprintf = snprintf(buf, buf_size, ##__VA_ARGS__);                \
+		if (__ret_strnprintf < 0 || (size_t)__ret_strnprintf >= (size_t)buf_size) \
+			__ret_strnprintf = ret_errno(EIO);				  \
+		__ret_strnprintf;                                                         \
+	})
+
+#define STRINGIFY(a) __STRINGIFY(a)
+#define __STRINGIFY(a) #a
 
 #endif /* __LXC_MACRO_H */
