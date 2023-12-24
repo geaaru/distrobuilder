@@ -32,18 +32,19 @@ packages:
 The `manager` keys specifies the package manager which is to be used.
 Valid package manager are:
 
-* apk
-* apt
-* dnf
-* egoportage (combination of portage and ego)
-* equo
-* luet
-* opkg
-* pacman
-* portage
-* xbps
-* yum
-* zypper
+* `apk`
+* `apt`
+* `dnf`
+* `egoportage` (combination of `portage` and `ego`)
+* `equo`
+* `opkg`
+* `pacman`
+* `portage`
+* `anise`
+* `slackpkg`
+* `xbps`
+* `yum`
+* `zypper`
 
 It's also possible to specify a custom package manager.
 This is useful if the desired package manager is not supported by distrobuilder.
