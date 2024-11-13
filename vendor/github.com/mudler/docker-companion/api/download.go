@@ -65,20 +65,20 @@ func DownloadAndUnpackImage(sourceImage, output string, opts *DownloadOpts) erro
 		jww.ERROR.Fatalln(err)
 		return err
 	}
-	manifest, err := hub.Manifest(repoPart, tagPart)
+	manifest, err := hub.ManifestV2(repoPart, tagPart)
 	if err != nil {
 		jww.ERROR.Fatalln(err)
 		return err
 	}
-	layers := manifest.FSLayers
+	layers := manifest.Layers
 	layers_sha := make([]string, 0)
 	for _, l := range layers {
 		jww.INFO.Println("Layer ", l)
 		// or obtain the digest from an existing manifest's FSLayer list
-		s := string(l.BlobSum)
+		s := string(l.Digest)
 		i := strings.Index(s, ":")
 		enc := s[i+1:]
-		reader, err := hub.DownloadBlob(repoPart, l.BlobSum)
+		reader, err := hub.DownloadBlob(repoPart, l.Digest)
 		layers_sha = append(layers_sha, enc)
 
 		if reader != nil {
